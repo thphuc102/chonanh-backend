@@ -62,6 +62,10 @@ app.post('/api/albums', async (req, res) => {
             }
         }
 
+        if (!cleanData.createdAt) {
+            cleanData.createdAt = new Date().toISOString();
+        }
+
         // Ensure ID is completely omitted if not provided so Prisma generates a UUID
         if (!cleanData.id) {
             delete cleanData.id;
