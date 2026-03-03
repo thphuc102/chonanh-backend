@@ -4,6 +4,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model Album {
@@ -38,6 +39,7 @@ model Album {
   zaloLink          String?
   totalViews        Int      @default(0)
   maxSelections     Int?
+  createdAt         String?
 
   // Nested JSON objects are native to Postgres Prisma
   settings          Json?
