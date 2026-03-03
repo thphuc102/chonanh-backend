@@ -4,30 +4,45 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model Album {
-  id              String   @id @default(uuid())
-  title           String
-  customerName    String?
-  customerEmail   String?
-  customerPhone   String?
-  coverImage      String?
-  creatorId       String?
-  creatorName     String?
-  createdAt       String
-  expiryDate      String?
-  status          String   @default("active")
-  selectionStatus String   @default("selecting")
-  driveLink       String?
-  maxSelections   Int?
-  imageCount      Int      @default(0)
-  totalViews      Int      @default(0)
-  priceLink       String?
-  zaloLink        String?
+  id                String   @id @default(uuid())
+  title             String
+  customerName      String?
+  customerEmail     String?
+  customerPhone     String?
+  coverImage        String?
+  imageCount        Int      @default(0)
+  size              String?
+  status            String   @default("Mới")
+  date              String?
+  creator           String?
+  creatorId         String?
+  creatorEmail      String?
+  domain            String?
+  driveLink         String?
+  downloadDriveLink String?
+  finalDriveLink    String?
+  tags              String[]
+  shootDate         String?
+  shootLocation     String?
+  password          String?
+  expiryDate        String?
+  landingCover      String?
+  landingAvatar     String?
+  landingFooter     String?
+  selectionStatus   String?  @default("selecting")
+  selectionLockedAt String?
+  priceLink         String?
+  zaloLink          String?
+  totalViews        Int      @default(0)
+  maxSelections     Int?
 
-  photos          Photo[]
+  // Nested JSON objects are native to Postgres Prisma
+  settings          Json?
+
+  photos            Photo[]
 }
 
 model Photo {
