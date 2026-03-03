@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Album {
+  id              String   @id @default(uuid())
+  title           String
+  customerName    String?
+  customerEmail   String?
+  customerPhone   String?
+  coverImage      String?
+  creatorId       String?
+  creatorName     String?
+  createdAt       String
+  expiryDate      String?
+  status          String   @default("active")
+  selectionStatus String   @default("selecting")
+  driveLink       String?
+  maxSelections   Int?
+  imageCount      Int      @default(0)
+  totalViews      Int      @default(0)
+  priceLink       String?
+  zaloLink        String?
+
+  photos          Photo[]
+}
+
+model Photo {
+  id           String   @id @default(uuid())
+  albumId      String
+  url          String
+  createdAt    String
+  likes        Int      @default(0)
+  tags         String[]
+  favorite     Boolean  @default(false)
+  commentCount Int      @default(0)
+  status       String   @default("active")
+  price        Float?
+
+  album        Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+}
