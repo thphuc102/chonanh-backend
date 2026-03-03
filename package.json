@@ -6,7 +6,7 @@
     "scripts": {
         "start": "node index.js",
         "dev": "node --watch index.js",
-        "build": "npx prisma generate"
+        "postinstall": "npx prisma generate"
     },
     "dependencies": {
         "@prisma/client": "^7.4.2",
