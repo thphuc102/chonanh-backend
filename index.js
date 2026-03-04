@@ -3,6 +3,7 @@ const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 require('dotenv').config();
 const { uploadFromUrlToR2 } = require('./utils/r2Client');
+const { batchCacheImages, isConfigured: isSupabaseConfigured } = require('./utils/supabaseStorage');
 
 const app = express();
 const prisma = new PrismaClient();
@@ -180,6 +181,66 @@ app.delete('/api/albums/:id', async (req, res) => {
             return res.status(404).json({ success: false, error: "Album not found" });
         }
         res.status(500).json({ success: false, error: "Failed to delete album", details: error.message });
+    }
+});
+
+// --- SUPABASE IMAGE CACHING API ---
+
+/**
+ * Cache Google Drive photos to Supabase Storage for fast CDN delivery.
+ * Finds all photos with /driveimg/ URLs and caches them to Supabase.
+ * Returns the count of newly cached and already-cached photos.
+ */
+app.post('/api/albums/:albumId/cache-images', async (req, res) => {
+    try {
+        if (!isSupabaseConfigured()) {
+            return res.json({ success: true, message: 'Supabase chưa cấu hình, bỏ qua caching', cached: 0 });
+        }
+
+        const albumId = req.params.albumId;
+
+        // Get photos that need caching (url starts with /driveimg/)
+        const photos = await prisma.photo.findMany({
+            where: {
+                albumId,
+                url: { startsWith: '/driveimg/' }
+            },
+            select: { id: true, url: true }
+        });
+
+        if (photos.length === 0) {
+            return res.json({ success: true, message: 'Tất cả ảnh đã được cache', cached: 0 });
+        }
+
+        console.log(`[cache-images] Bắt đầu cache ${photos.length} ảnh cho album ${albumId}`);
+
+        const { results, errors } = await batchCacheImages(photos, albumId);
+
+        // Update photos in DB with Supabase CDN URLs
+        const updateEntries = Object.entries(results);
+        if (updateEntries.length > 0) {
+            await prisma.$transaction(
+                updateEntries.map(([photoId, supabaseUrl]) =>
+                    prisma.photo.update({
+                        where: { id: photoId },
+                        data: { url: supabaseUrl, thumbnailLink: supabaseUrl }
+                    })
+                )
+            );
+        }
+
+        console.log(`[cache-images] Hoàn tất: ${updateEntries.length} cached, ${errors.length} lỗi`);
+
+        res.json({
+            success: true,
+            cached: updateEntries.length,
+            failed: errors.length,
+            total: photos.length,
+            errors: errors.slice(0, 5) // Chỉ trả 5 lỗi đầu
+        });
+    } catch (error) {
+        console.error('[cache-images] Error:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
