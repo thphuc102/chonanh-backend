@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json());
 
 // --- ROUTES ---
 
@@ -54,19 +54,11 @@ app.post('/api/albums', async (req, res) => {
     try {
         const albumData = req.body;
 
-        const allowedKeys = [
-            'id', 'title', 'customerName', 'customerEmail', 'customerPhone', 'coverImage',
-            'imageCount', 'size', 'status', 'date', 'creator', 'creatorId', 'creatorEmail',
-            'domain', 'driveLink', 'downloadDriveLink', 'finalDriveLink', 'tags', 'shootDate',
-            'shootLocation', 'password', 'expiryDate', 'landingCover', 'landingAvatar',
-            'landingFooter', 'selectionStatus', 'selectionLockedAt', 'priceLink', 'zaloLink',
-            'totalViews', 'maxSelections', 'createdAt', 'settings'
-        ];
-
+        // Clean up undefined/null values that Prisma might reject or shouldn't be overridden
         const cleanData = {};
-        for (const key of allowedKeys) {
-            if (albumData[key] !== undefined && albumData[key] !== null) {
-                cleanData[key] = albumData[key];
+        for (const [key, value] of Object.entries(albumData)) {
+            if (value !== undefined && value !== null) {
+                cleanData[key] = value;
             }
         }
 
@@ -86,9 +78,6 @@ app.post('/api/albums', async (req, res) => {
         res.status(201).json({ success: true, data: newAlbum });
     } catch (error) {
         console.error("Error creating album:", error);
-        if (error.code === 'P2002') {
-            return res.status(200).json({ success: true, message: "Album already exists" });
-        }
         res.status(500).json({ success: false, error: "Failed to create album", details: error.message });
     }
 });
@@ -114,20 +103,11 @@ app.put('/api/albums/:id', async (req, res) => {
     try {
         const updates = req.body;
 
-        const allowedAlbumKeys = [
-            'title', 'customerName', 'customerEmail', 'customerPhone', 'coverImage',
-            'imageCount', 'size', 'status', 'date', 'creator', 'creatorId', 'creatorEmail',
-            'domain', 'driveLink', 'downloadDriveLink', 'finalDriveLink', 'tags', 'shootDate',
-            'shootLocation', 'password', 'expiryDate', 'landingCover', 'landingAvatar',
-            'landingFooter', 'selectionStatus', 'selectionLockedAt', 'priceLink', 'zaloLink',
-            'totalViews', 'maxSelections', 'createdAt', 'settings'
-        ];
-
-        // Clean up undefined/null values and unknown fields
+        // Clean up undefined/null values
         const cleanUpdates = {};
-        for (const key of allowedAlbumKeys) {
-            if (updates[key] !== undefined) {
-                cleanUpdates[key] = updates[key];
+        for (const [key, value] of Object.entries(updates)) {
+            if (value !== undefined) {
+                cleanUpdates[key] = value;
             }
         }
 
@@ -162,269 +142,6 @@ app.delete('/api/albums/:id', async (req, res) => {
             return res.status(404).json({ success: false, error: "Album not found" });
         }
         res.status(500).json({ success: false, error: "Failed to delete album", details: error.message });
-    }
-});
-
-// --- PHOTOS API ---
-
-// Get photos by album
-app.get('/api/albums/:albumId/photos', async (req, res) => {
-    try {
-        const photos = await prisma.photo.findMany({
-            where: { albumId: req.params.albumId },
-            orderBy: { createdAt: 'desc' }
-        });
-        res.json({ success: true, count: photos.length, data: photos });
-    } catch (error) {
-        console.error("Error fetching photos:", error);
-        res.status(500).json({ success: false, error: "Failed to fetch photos" });
-    }
-});
-
-// Batch add photos
-app.post('/api/albums/:albumId/photos', async (req, res) => {
-    try {
-        const { photos } = req.body; // Array of photo objects
-        if (!photos || !Array.isArray(photos) || photos.length === 0) {
-            return res.status(400).json({ success: false, error: "No photos provided" });
-        }
-
-        const allowedPhotoKeys = [
-            'id', 'albumId', 'name', 'url', 'thumbnailLink', 'downloadUrl', 'isInWeddingView',
-            'isFavorite', 'isSuggested', 'commentCount', 'comments', 'tags', 'source',
-            'createdAt', 'likes', 'likeCount'
-        ];
-
-        const albumId = req.params.albumId;
-        const cleanPhotos = photos.map(p => {
-            const clean = {};
-            for (const key of allowedPhotoKeys) {
-                if (p[key] !== undefined && p[key] !== null) {
-                    clean[key] = p[key];
-                }
-            }
-            clean.albumId = albumId;
-            if (!clean.createdAt) clean.createdAt = new Date().toISOString();
-            return clean;
-        });
-
-        // Use createMany for efficiency, skipDuplicates to avoid errors on re-sync
-        const result = await prisma.photo.createMany({
-            data: cleanPhotos,
-            skipDuplicates: true
-        });
-
-        res.status(201).json({ success: true, count: result.count });
-    } catch (error) {
-        console.error("Error adding photos:", error);
-        res.status(500).json({ success: false, error: "Failed to add photos", details: error.message });
-    }
-});
-
-// Update single photo
-app.put('/api/photos/:id', async (req, res) => {
-    try {
-        const updates = req.body;
-        const allowedPhotoKeys = [
-            'name', 'url', 'thumbnailLink', 'downloadUrl', 'isInWeddingView',
-            'isFavorite', 'isSuggested', 'commentCount', 'comments', 'tags', 'source',
-            'likes', 'likeCount'
-        ];
-
-        const cleanUpdates = {};
-        for (const key of allowedPhotoKeys) {
-            if (updates[key] !== undefined) {
-                cleanUpdates[key] = updates[key];
-            }
-        }
-        delete cleanUpdates.id;
-        delete cleanUpdates.albumId; // Don't allow changing album
-
-        const photo = await prisma.photo.update({
-            where: { id: req.params.id },
-            data: cleanUpdates
-        });
-        res.json({ success: true, data: photo });
-    } catch (error) {
-        console.error("Error updating photo:", error);
-        if (error.code === 'P2025') {
-            return res.status(404).json({ success: false, error: "Photo not found" });
-        }
-        res.status(500).json({ success: false, error: "Failed to update photo", details: error.message });
-    }
-});
-
-// Batch update photos
-app.post('/api/photos/batch-update', async (req, res) => {
-    try {
-        const { updates } = req.body; // Array of { id, data }
-        if (!updates || !Array.isArray(updates)) {
-            return res.status(400).json({ success: false, error: "Invalid updates format" });
-        }
-
-        const allowedPhotoKeys = [
-            'name', 'url', 'thumbnailLink', 'downloadUrl', 'isInWeddingView',
-            'isFavorite', 'isSuggested', 'commentCount', 'comments', 'tags', 'source',
-            'likes', 'likeCount'
-        ];
-
-        const results = await prisma.$transaction(
-            updates.map(u => {
-                const cleanData = {};
-                for (const key of allowedPhotoKeys) {
-                    if (u.data[key] !== undefined) {
-                        cleanData[key] = u.data[key];
-                    }
-                }
-                delete cleanData.id;
-                return prisma.photo.update({
-                    where: { id: u.id },
-                    data: cleanData
-                });
-            })
-        );
-
-        res.json({ success: true, count: results.length });
-    } catch (error) {
-        console.error("Error batch updating photos:", error);
-        res.status(500).json({ success: false, error: "Failed to batch update", details: error.message });
-    }
-});
-
-// Get single photo
-app.get('/api/photos/:id', async (req, res) => {
-    try {
-        const photo = await prisma.photo.findUnique({ where: { id: req.params.id } });
-        if (!photo) return res.status(404).json({ success: false, error: "Photo not found" });
-        res.json({ success: true, data: photo });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to fetch photo" });
-    }
-});
-
-
-
-// --- AUDIT LOGS API ---
-
-app.get('/api/audit-logs', async (req, res) => {
-    try {
-        const logs = await prisma.auditLog.findMany({
-            orderBy: { timestamp: 'desc' },
-            take: 50
-        });
-        res.json({ success: true, data: logs });
-    } catch (error) {
-        console.error("Error fetching audit logs:", error);
-        res.status(500).json({ success: false, error: "Failed to fetch audit logs" });
-    }
-});
-
-app.post('/api/audit-logs', async (req, res) => {
-    try {
-        const logData = req.body;
-
-        const allowedLogKeys = [
-            'userId', 'userName', 'action', 'details', 'timestamp', 'ipAddress', 'status'
-        ];
-
-        const cleanData = {};
-        for (const key of allowedLogKeys) {
-            if (logData[key] !== undefined && logData[key] !== null) {
-                cleanData[key] = logData[key];
-            }
-        }
-
-        if (!cleanData.timestamp) cleanData.timestamp = new Date().toISOString();
-
-        const log = await prisma.auditLog.create({
-            data: cleanData
-        });
-        res.status(201).json({ success: true, data: log });
-    } catch (error) {
-        console.error("Error creating audit log:", error);
-        res.status(500).json({ success: false, error: "Failed to create audit log" });
-    }
-});
-
-// --- NOTIFICATIONS API ---
-
-app.get('/api/notifications', async (req, res) => {
-    try {
-        const notifications = await prisma.notification.findMany({
-            orderBy: { createdAt: 'desc' },
-            take: 50
-        });
-        res.json({ success: true, data: notifications });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to fetch notifications" });
-    }
-});
-
-app.post('/api/notifications', async (req, res) => {
-    try {
-        const data = req.body;
-        if (!data.createdAt) data.createdAt = new Date().toISOString();
-        const notification = await prisma.notification.create({ data });
-        res.status(201).json({ success: true, data: notification });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to create notification" });
-    }
-});
-
-app.put('/api/notifications/:id', async (req, res) => {
-    try {
-        const notification = await prisma.notification.update({
-            where: { id: req.params.id },
-            data: req.body
-        });
-        res.json({ success: true, data: notification });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to update notification" });
-    }
-});
-
-// --- CONTACT REQUESTS API ---
-
-app.get('/api/contact-requests', async (req, res) => {
-    try {
-        const requests = await prisma.contactRequest.findMany({
-            orderBy: { createdAt: 'desc' }
-        });
-        res.json({ success: true, data: requests });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to fetch contact requests" });
-    }
-});
-
-app.post('/api/contact-requests', async (req, res) => {
-    try {
-        const data = req.body;
-        if (!data.createdAt) data.createdAt = new Date().toISOString();
-        const request = await prisma.contactRequest.create({ data });
-        res.status(201).json({ success: true, data: request });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to create contact request", details: error.message });
-    }
-});
-
-app.put('/api/contact-requests/:id', async (req, res) => {
-    try {
-        const request = await prisma.contactRequest.update({
-            where: { id: req.params.id },
-            data: req.body
-        });
-        res.json({ success: true, data: request });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to update contact request" });
-    }
-});
-
-app.delete('/api/contact-requests/:id', async (req, res) => {
-    try {
-        await prisma.contactRequest.delete({ where: { id: req.params.id } });
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to delete contact request" });
     }
 });
 
