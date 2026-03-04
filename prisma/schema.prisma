@@ -41,23 +41,89 @@ model Album {
   maxSelections     Int?
   createdAt         String?
 
-  // Nested JSON objects are native to Postgres Prisma
   settings          Json?
 
   photos            Photo[]
 }
 
 model Photo {
-  id           String   @id @default(uuid())
-  albumId      String
-  url          String
-  createdAt    String
-  likes        Int      @default(0)
-  tags         String[]
-  favorite     Boolean  @default(false)
-  commentCount Int      @default(0)
-  status       String   @default("active")
-  price        Float?
+  id              String   @id @default(uuid())
+  albumId         String
+  name            String   @default("")
+  url             String
+  thumbnailLink   String?
+  downloadUrl     String?
+  isInWeddingView Boolean  @default(false)
+  isFavorite      Boolean  @default(false)
+  isSuggested     Boolean  @default(false)
+  commentCount    Int      @default(0)
+  comments        Json     @default("[]")
+  tags            String[]
+  source          String   @default("drive")
+  createdAt       String   @default("")
+  likes           String[] @default([])
+  likeCount       Int      @default(0)
 
-  album        Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  album           Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+
+  @@index([albumId])
+}
+
+model Setting {
+  id    String @id @default("global")
+  data  Json
+}
+
+model AuditLog {
+  id        String @id @default(uuid())
+  userId    String
+  userName  String
+  action    String
+  details   String
+  timestamp String
+  ipAddress String?
+  status    String @default("Success")
+}
+
+model Notification {
+  id        String  @id @default(uuid())
+  type      String
+  title     String
+  message   String
+  albumId   String?
+  userId    String?
+  read      Boolean @default(false)
+  createdAt String
+}
+
+model ContactRequest {
+  id            String  @id @default(uuid())
+  userId        String
+  userName      String
+  email         String
+  phone         String
+  requestType   String
+  message       String?
+  notes         String?
+  planRequested String?
+  billingCycle  String?
+  albumId       String?
+  albumName     String?
+  status        String  @default("pending")
+  createdAt     String?
+  contactedAt   String?
+  completedAt   String?
+  respondedAt   String?
+  respondedBy   String?
+  adminNotes    String?
+}
+
+model Workspace {
+  id        String @id @default(uuid())
+  userId    String
+  name      String
+  color     String
+  createdAt String
+
+  @@index([userId])
 }
