@@ -54,11 +54,19 @@ app.post('/api/albums', async (req, res) => {
     try {
         const albumData = req.body;
 
-        // Clean up undefined/null values that Prisma might reject or shouldn't be overridden
+        const allowedKeys = [
+            'id', 'title', 'customerName', 'customerEmail', 'customerPhone', 'coverImage',
+            'imageCount', 'size', 'status', 'date', 'creator', 'creatorId', 'creatorEmail',
+            'domain', 'driveLink', 'downloadDriveLink', 'finalDriveLink', 'tags', 'shootDate',
+            'shootLocation', 'password', 'expiryDate', 'landingCover', 'landingAvatar',
+            'landingFooter', 'selectionStatus', 'selectionLockedAt', 'priceLink', 'zaloLink',
+            'totalViews', 'maxSelections', 'createdAt', 'settings'
+        ];
+
         const cleanData = {};
-        for (const [key, value] of Object.entries(albumData)) {
-            if (value !== undefined && value !== null) {
-                cleanData[key] = value;
+        for (const key of allowedKeys) {
+            if (albumData[key] !== undefined && albumData[key] !== null) {
+                cleanData[key] = albumData[key];
             }
         }
 
@@ -78,6 +86,9 @@ app.post('/api/albums', async (req, res) => {
         res.status(201).json({ success: true, data: newAlbum });
     } catch (error) {
         console.error("Error creating album:", error);
+        if (error.code === 'P2002') {
+            return res.status(200).json({ success: true, message: "Album already exists" });
+        }
         res.status(500).json({ success: false, error: "Failed to create album", details: error.message });
     }
 });
@@ -103,11 +114,20 @@ app.put('/api/albums/:id', async (req, res) => {
     try {
         const updates = req.body;
 
-        // Clean up undefined/null values
+        const allowedAlbumKeys = [
+            'title', 'customerName', 'customerEmail', 'customerPhone', 'coverImage',
+            'imageCount', 'size', 'status', 'date', 'creator', 'creatorId', 'creatorEmail',
+            'domain', 'driveLink', 'downloadDriveLink', 'finalDriveLink', 'tags', 'shootDate',
+            'shootLocation', 'password', 'expiryDate', 'landingCover', 'landingAvatar',
+            'landingFooter', 'selectionStatus', 'selectionLockedAt', 'priceLink', 'zaloLink',
+            'totalViews', 'maxSelections', 'createdAt', 'settings'
+        ];
+
+        // Clean up undefined/null values and unknown fields
         const cleanUpdates = {};
-        for (const [key, value] of Object.entries(updates)) {
-            if (value !== undefined) {
-                cleanUpdates[key] = value;
+        for (const key of allowedAlbumKeys) {
+            if (updates[key] !== undefined) {
+                cleanUpdates[key] = updates[key];
             }
         }
 
@@ -169,11 +189,19 @@ app.post('/api/albums/:albumId/photos', async (req, res) => {
             return res.status(400).json({ success: false, error: "No photos provided" });
         }
 
+        const allowedPhotoKeys = [
+            'id', 'albumId', 'name', 'url', 'thumbnailLink', 'downloadUrl', 'isInWeddingView',
+            'isFavorite', 'isSuggested', 'commentCount', 'comments', 'tags', 'source',
+            'createdAt', 'likes', 'likeCount'
+        ];
+
         const albumId = req.params.albumId;
         const cleanPhotos = photos.map(p => {
             const clean = {};
-            for (const [key, value] of Object.entries(p)) {
-                if (value !== undefined) clean[key] = value;
+            for (const key of allowedPhotoKeys) {
+                if (p[key] !== undefined && p[key] !== null) {
+                    clean[key] = p[key];
+                }
             }
             clean.albumId = albumId;
             if (!clean.createdAt) clean.createdAt = new Date().toISOString();
@@ -197,9 +225,17 @@ app.post('/api/albums/:albumId/photos', async (req, res) => {
 app.put('/api/photos/:id', async (req, res) => {
     try {
         const updates = req.body;
+        const allowedPhotoKeys = [
+            'name', 'url', 'thumbnailLink', 'downloadUrl', 'isInWeddingView',
+            'isFavorite', 'isSuggested', 'commentCount', 'comments', 'tags', 'source',
+            'likes', 'likeCount'
+        ];
+
         const cleanUpdates = {};
-        for (const [key, value] of Object.entries(updates)) {
-            if (value !== undefined) cleanUpdates[key] = value;
+        for (const key of allowedPhotoKeys) {
+            if (updates[key] !== undefined) {
+                cleanUpdates[key] = updates[key];
+            }
         }
         delete cleanUpdates.id;
         delete cleanUpdates.albumId; // Don't allow changing album
@@ -226,11 +262,19 @@ app.post('/api/photos/batch-update', async (req, res) => {
             return res.status(400).json({ success: false, error: "Invalid updates format" });
         }
 
+        const allowedPhotoKeys = [
+            'name', 'url', 'thumbnailLink', 'downloadUrl', 'isInWeddingView',
+            'isFavorite', 'isSuggested', 'commentCount', 'comments', 'tags', 'source',
+            'likes', 'likeCount'
+        ];
+
         const results = await prisma.$transaction(
             updates.map(u => {
                 const cleanData = {};
-                for (const [key, value] of Object.entries(u.data)) {
-                    if (value !== undefined) cleanData[key] = value;
+                for (const key of allowedPhotoKeys) {
+                    if (u.data[key] !== undefined) {
+                        cleanData[key] = u.data[key];
+                    }
                 }
                 delete cleanData.id;
                 return prisma.photo.update({
@@ -258,32 +302,7 @@ app.get('/api/photos/:id', async (req, res) => {
     }
 });
 
-// --- SETTINGS API ---
 
-app.get('/api/settings', async (req, res) => {
-    try {
-        const setting = await prisma.setting.findUnique({ where: { id: 'global' } });
-        res.json({ success: true, data: setting ? setting.data : null });
-    } catch (error) {
-        console.error("Error fetching settings:", error);
-        res.status(500).json({ success: false, error: "Failed to fetch settings" });
-    }
-});
-
-app.put('/api/settings', async (req, res) => {
-    try {
-        const data = req.body;
-        const setting = await prisma.setting.upsert({
-            where: { id: 'global' },
-            update: { data },
-            create: { id: 'global', data }
-        });
-        res.json({ success: true, data: setting.data });
-    } catch (error) {
-        console.error("Error updating settings:", error);
-        res.status(500).json({ success: false, error: "Failed to update settings" });
-    }
-});
 
 // --- AUDIT LOGS API ---
 
@@ -303,8 +322,23 @@ app.get('/api/audit-logs', async (req, res) => {
 app.post('/api/audit-logs', async (req, res) => {
     try {
         const logData = req.body;
-        if (!logData.timestamp) logData.timestamp = new Date().toISOString();
-        const log = await prisma.auditLog.create({ data: logData });
+
+        const allowedLogKeys = [
+            'userId', 'userName', 'action', 'details', 'timestamp', 'ipAddress', 'status'
+        ];
+
+        const cleanData = {};
+        for (const key of allowedLogKeys) {
+            if (logData[key] !== undefined && logData[key] !== null) {
+                cleanData[key] = logData[key];
+            }
+        }
+
+        if (!cleanData.timestamp) cleanData.timestamp = new Date().toISOString();
+
+        const log = await prisma.auditLog.create({
+            data: cleanData
+        });
         res.status(201).json({ success: true, data: log });
     } catch (error) {
         console.error("Error creating audit log:", error);
@@ -394,6 +428,33 @@ app.delete('/api/contact-requests/:id', async (req, res) => {
     }
 });
 
+// --- SETTINGS API ---
+
+app.get('/api/settings', async (req, res) => {
+    try {
+        const setting = await prisma.setting.findUnique({ where: { id: 'global' } });
+        res.json({ success: true, data: setting ? setting.data : null });
+    } catch (error) {
+        console.error("Error fetching settings:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch settings" });
+    }
+});
+
+app.put('/api/settings', async (req, res) => {
+    try {
+        const data = req.body;
+        const setting = await prisma.setting.upsert({
+            where: { id: 'global' },
+            update: { data },
+            create: { id: 'global', data }
+        });
+        res.json({ success: true, data: setting.data });
+    } catch (error) {
+        console.error("Error updating settings:", error);
+        res.status(500).json({ success: false, error: "Failed to update settings" });
+    }
+});
+
 // --- WORKSPACES API ---
 
 app.get('/api/workspaces/:userId', async (req, res) => {
@@ -404,18 +465,18 @@ app.get('/api/workspaces/:userId', async (req, res) => {
         });
         res.json({ success: true, data: workspaces });
     } catch (error) {
+        console.error("Error fetching workspaces:", error);
         res.status(500).json({ success: false, error: "Failed to fetch workspaces" });
     }
 });
 
 app.post('/api/workspaces', async (req, res) => {
     try {
-        const data = req.body;
-        if (!data.createdAt) data.createdAt = new Date().toISOString();
-        const workspace = await prisma.workspace.create({ data });
+        const workspace = await prisma.workspace.create({ data: req.body });
         res.status(201).json({ success: true, data: workspace });
     } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to create workspace", details: error.message });
+        console.error("Error creating workspace:", error);
+        res.status(500).json({ success: false, error: "Failed to create workspace" });
     }
 });
 
@@ -427,6 +488,7 @@ app.put('/api/workspaces/:id', async (req, res) => {
         });
         res.json({ success: true, data: workspace });
     } catch (error) {
+        console.error("Error updating workspace:", error);
         res.status(500).json({ success: false, error: "Failed to update workspace" });
     }
 });
@@ -436,6 +498,7 @@ app.delete('/api/workspaces/:id', async (req, res) => {
         await prisma.workspace.delete({ where: { id: req.params.id } });
         res.json({ success: true });
     } catch (error) {
+        console.error("Error deleting workspace:", error);
         res.status(500).json({ success: false, error: "Failed to delete workspace" });
     }
 });
