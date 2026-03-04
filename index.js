@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 require('dotenv').config();
+const { uploadFromUrlToR2 } = require('./utils/r2Client');
 
 const app = express();
 const prisma = new PrismaClient();
@@ -31,6 +32,23 @@ app.get('/api/health', async (req, res) => {
     } catch (error) {
         console.error("Database connection failed:", error);
         res.status(500).json({ status: 'ERROR', database: 'disconnected', error: error.message });
+    }
+});
+
+// --- CLOUDFLARE R2 API ---
+
+app.post('/api/r2/backup-drive-photo', async (req, res) => {
+    try {
+        const { url, originalName, albumId } = req.body;
+        if (!url || !albumId) {
+            return res.status(400).json({ success: false, error: 'Missing url or albumId' });
+        }
+
+        const r2Url = await uploadFromUrlToR2(url, originalName || 'photo.jpg', albumId);
+        res.json({ success: true, url: r2Url });
+    } catch (error) {
+        console.error("R2 Upload Error:", error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
