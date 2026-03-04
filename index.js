@@ -86,6 +86,9 @@ app.post('/api/albums', async (req, res) => {
         res.status(201).json({ success: true, data: newAlbum });
     } catch (error) {
         console.error("Error creating album:", error);
+        if (error.code === 'P2002') {
+            return res.status(200).json({ success: true, message: "Album already exists" });
+        }
         res.status(500).json({ success: false, error: "Failed to create album", details: error.message });
     }
 });
@@ -422,52 +425,6 @@ app.delete('/api/contact-requests/:id', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ success: false, error: "Failed to delete contact request" });
-    }
-});
-
-// --- WORKSPACES API ---
-
-app.get('/api/workspaces/:userId', async (req, res) => {
-    try {
-        const workspaces = await prisma.workspace.findMany({
-            where: { userId: req.params.userId },
-            orderBy: { createdAt: 'asc' }
-        });
-        res.json({ success: true, data: workspaces });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to fetch workspaces" });
-    }
-});
-
-app.post('/api/workspaces', async (req, res) => {
-    try {
-        const data = req.body;
-        if (!data.createdAt) data.createdAt = new Date().toISOString();
-        const workspace = await prisma.workspace.create({ data });
-        res.status(201).json({ success: true, data: workspace });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to create workspace", details: error.message });
-    }
-});
-
-app.put('/api/workspaces/:id', async (req, res) => {
-    try {
-        const workspace = await prisma.workspace.update({
-            where: { id: req.params.id },
-            data: req.body
-        });
-        res.json({ success: true, data: workspace });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to update workspace" });
-    }
-});
-
-app.delete('/api/workspaces/:id', async (req, res) => {
-    try {
-        await prisma.workspace.delete({ where: { id: req.params.id } });
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: "Failed to delete workspace" });
     }
 });
 
