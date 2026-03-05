@@ -520,9 +520,9 @@ app.listen(PORT, () => {
 
     setInterval(async () => {
         try {
-            const res = await fetch(`${RENDER_URL}/api/health`);
+            const res = await fetch(`${RENDER_URL}/`);
             const data = await res.json();
-            console.log(`🏓 Keep-alive ping: ${data.status} | ${new Date().toISOString()}`);
+            console.log(`🏓 Keep-alive ping: ${data.message} | ${new Date().toISOString()}`);
         } catch (err) {
             console.error(`❌ Keep-alive ping failed:`, err.message);
         }
