@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const { PrismaClient } = require('@prisma/client');
 require('dotenv').config();
 
@@ -8,6 +9,7 @@ const prisma = new PrismaClient();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
+app.use(compression()); // Gzip compress all responses
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
@@ -174,6 +176,8 @@ app.get('/api/albums/:albumId/photos', async (req, res) => {
             where: { albumId: req.params.albumId },
             orderBy: { createdAt: 'desc' }
         });
+        // Cache for 30 seconds on client to reduce repeated fetches
+        res.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
         res.json({ success: true, count: photos.length, data: photos });
     } catch (error) {
         console.error("Error fetching photos:", error);
@@ -510,9 +514,9 @@ app.listen(PORT, () => {
 
     // --- KEEP-ALIVE SELF-PING ---
     // Render free tier sleeps after 15 min inactivity.
-    // Self-ping every 14 minutes to stay awake.
+    // Self-ping every 12 minutes to stay awake (buffer before 15 min timeout).
     const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `https://chonanh-backend.onrender.com`;
-    const PING_INTERVAL = 14 * 60 * 1000; // 14 minutes
+    const PING_INTERVAL = 12 * 60 * 1000; // 12 minutes (reduced from 14)
 
     setInterval(async () => {
         try {
@@ -524,5 +528,5 @@ app.listen(PORT, () => {
         }
     }, PING_INTERVAL);
 
-    console.log(`🏓 Keep-alive ping enabled: every 14 minutes`);
+    console.log(`🏓 Keep-alive ping enabled: every 12 minutes`);
 });
