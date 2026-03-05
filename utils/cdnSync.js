@@ -5,8 +5,8 @@
  * in parallel. Updates the database record with CDN URLs on success.
  *
  * Strategy:
- *   photo.url          → Cloudflare R2 CDN URL  (fast global delivery, 0 egress)
- *   photo.thumbnailLink → Supabase Storage URL   (backup CDN, same infra as DB)
+ *   photo.url          → Supabase Storage URL    (primary, same infra as DB)
+ *   photo.thumbnailLink → Cloudflare R2 CDN URL  (secondary, fast global delivery, 0 egress)
  *
  * A photo is considered "migrated" when photo.url no longer contains a
  * Google Drive domain (googleusercontent.com / drive.google.com).
@@ -77,8 +77,8 @@ async function migrateBatchToCDN(prisma, photos, concurrency = 3) {
 
             // Build DB update — only update fields that succeeded
             const dbUpdate = {};
-            if (r2Url)       dbUpdate.url           = r2Url;       // primary CDN URL
-            if (supabaseUrl) dbUpdate.thumbnailLink  = supabaseUrl; // backup CDN URL
+            if (supabaseUrl) dbUpdate.url           = supabaseUrl; // primary: Supabase (same infra as DB)
+            if (r2Url)       dbUpdate.thumbnailLink  = r2Url;       // secondary: R2 (fast CDN layer)
 
             try {
                 await prisma.photo.update({ where: { id: photo.id }, data: dbUpdate });
@@ -116,8 +116,8 @@ async function getCDNStats(prisma) {
     ]);
 
     const migrated   = total - withDriveUrl;
-    const r2Count    = await prisma.photo.count({ where: { url: { contains: 'r2.dev' } } });
-    const supaCount  = await prisma.photo.count({ where: { thumbnailLink: { contains: 'supabase.co/storage' } } });
+    const supaCount  = await prisma.photo.count({ where: { url: { contains: 'supabase.co/storage' } } });
+    const r2Count    = await prisma.photo.count({ where: { thumbnailLink: { contains: 'r2.dev' } } });
 
     return {
         total,
