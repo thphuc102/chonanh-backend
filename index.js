@@ -4,6 +4,9 @@ const compression = require('compression');
 const { PrismaClient } = require('@prisma/client');
 require('dotenv').config();
 
+// CDN Sync utilities (Cloudflare R2 + Supabase Storage)
+const { migrateBatchToCDN, getCDNStats, isDriveUrl } = require('./utils/cdnSync');
+
 const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 5000;
@@ -506,6 +509,66 @@ app.delete('/api/workspaces/:id', async (req, res) => {
         res.status(500).json({ success: false, error: "Failed to delete workspace" });
     }
 });
+
+// ─── CDN MAINTENANCE ROUTES ───────────────────────────────────────────────────
+
+// GET /api/admin/cdn-status — Thống kê trạng thái migration
+app.get('/api/admin/cdn-status', async (req, res) => {
+    try {
+        const stats = await getCDNStats(prisma);
+        res.json({ success: true, data: stats });
+    } catch (error) {
+        console.error('cdn-status error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /api/admin/migrate-cdn — Chạy migration batch
+// Body: { albumId?: string, limit?: number, concurrency?: number }
+//   albumId    — chỉ migrate album cụ thể; bỏ trống = migrate toàn bộ
+//   limit      — số ảnh mỗi lần chạy (default 20)
+//   concurrency — upload song song (default 3)
+app.post('/api/admin/migrate-cdn', async (req, res) => {
+    const { albumId, limit = 20, concurrency = 3 } = req.body || {};
+    try {
+        // Tìm ảnh còn Drive URL (chưa migrate)
+        const where = {
+            OR: [
+                { url: { contains: 'googleusercontent.com' } },
+                { url: { contains: 'drive.google.com' } },
+            ],
+            ...(albumId ? { albumId } : {}),
+        };
+
+        const photos = await prisma.photo.findMany({
+            where,
+            select: { id: true, url: true, name: true, albumId: true },
+            take: Math.min(limit, 50), // tối đa 50 mỗi request
+            orderBy: { albumId: 'asc' },
+        });
+
+        if (photos.length === 0) {
+            return res.json({ success: true, message: 'Không còn ảnh cần migrate', processed: 0 });
+        }
+
+        console.log(`[CDN] Bắt đầu migrate ${photos.length} ảnh (concurrency=${concurrency})...`);
+        const result = await migrateBatchToCDN(prisma, photos, concurrency);
+        const stats  = await getCDNStats(prisma);
+
+        res.json({
+            success: true,
+            processed: photos.length,
+            succeeded: result.succeeded,
+            failed: result.failed,
+            globalStats: stats,
+        });
+    } catch (error) {
+        console.error('migrate-cdn error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Start Server
 app.listen(PORT, () => {
