@@ -714,10 +714,18 @@ async function fetchAndCache(cacheKey, url, extraHeaders = {}) {
         signal: AbortSignal.timeout(15_000),
     });
 
-    if (!response.ok) throw Object.assign(new Error(`Upstream ${response.status}`), { status: 502 });
+    if (!response.ok) {
+        const err = new Error(`Upstream ${response.status}`);
+        err.status = response.status; // giữ nguyên status gốc để caller phân biệt 403 vs 5xx
+        throw err;
+    }
 
     const contentType = response.headers.get('content-type') || 'image/jpeg';
-    if (contentType.includes('text/html')) throw Object.assign(new Error('Got HTML instead of image'), { status: 502 });
+    if (contentType.includes('text/html')) {
+        const err = new Error('Got HTML instead of image');
+        err.status = 422;
+        throw err;
+    }
 
     const buffer = Buffer.from(await response.arrayBuffer());
 
@@ -726,44 +734,64 @@ async function fetchAndCache(cacheKey, url, extraHeaders = {}) {
     return { buffer, contentType, hit: false };
 }
 
-// ─── /api/img/:driveId — Proxy ảnh Google Drive qua drive_id (chiến lược mới) ─
-//
-// Ưu tiên thứ tự:
-//   1. lh3.googleusercontent.com/d/{driveId}=s1600  (nhanh, không cần API key)
-//   2. drive.google.com/uc?export=view&id={driveId} (fallback)
-//
-// Query params:
-//   size: width px (default 1600). Ví dụ: /api/img/abc123?size=400 → thumbnail
-app.get('/api/img/:driveId', async (req, res) => {
-    const { driveId } = req.params;
-    const size = Math.min(parseInt(req.query.size) || 1600, 4096);
+// 1x1 transparent PNG — placeholder khi cả 2 nguồn fail
+const PLACEHOLDER_PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64'
+);
 
-    // Validate driveId format (alphanumeric, hyphens, underscores only)
+// ─── /api/img/:driveId — Proxy ảnh Google Drive qua drive_id ─────────────────
+//
+// Thứ tự ưu tiên:
+//   1. lh3.googleusercontent.com/d/{id}=s{size}   (nhanh, không cần API key)
+//   2. drive.google.com/uc?export=view&id={id}    (fallback khi lh3 bị chặn)
+//   3. Placeholder 1×1 PNG                        (khi cả 2 đều fail)
+//
+// Query: ?size=<px> (default 1600, max 4096)
+app.get('/api/img/:driveId', async (req, res) => {
+    const rawId = req.params.driveId;
+
+    // Trích xuất driveId thuần túy — chỉ giữ chuỗi alphanumeric/dash/underscore
+    // Loại bỏ path rác kiểu "/drive-storage/..." nếu client vô tình truyền cả URL
+    const driveId = rawId.replace(/^.*\/([a-zA-Z0-9_-]{10,})(?:[=?].*)?$/, '$1').trim();
+
     if (!/^[a-zA-Z0-9_-]{10,}$/.test(driveId)) {
-        return res.status(400).json({ error: 'Invalid driveId format' });
+        return res.status(400).json({ error: `Invalid driveId: "${rawId}"` });
     }
 
+    const size = Math.min(parseInt(req.query.size) || 1600, 4096);
     const cacheKey = `drive:${driveId}:${size}`;
 
+    console.log(`[img] Fetching driveId="${driveId}" size=${size}`);
+
+    // Attempt 1 — lh3 (nhanh nhất, không cần auth nếu file Public)
+    const primaryUrl = `https://lh3.googleusercontent.com/d/${driveId}=s${size}`;
     try {
-        // Attempt 1: lh3.googleusercontent.com (không yêu cầu login nếu file là Public)
-        const primaryUrl = `https://lh3.googleusercontent.com/d/${driveId}=s${size}`;
-        try {
-            const result = await fetchAndCache(cacheKey, primaryUrl);
-            return sendImage(res, result.buffer, result.contentType, result.hit);
-        } catch (primaryErr) {
-            console.warn(`[img/${driveId}] lh3 failed (${primaryErr.message}), trying uc fallback...`);
-        }
-
-        // Attempt 2: Drive export URL
-        const fallbackUrl = `https://drive.google.com/uc?export=view&id=${driveId}`;
-        const result = await fetchAndCache(cacheKey, fallbackUrl);
+        const result = await fetchAndCache(cacheKey, primaryUrl);
+        console.log(`[img/${driveId}] lh3 ${result.hit ? 'CACHE HIT' : 'OK'}`);
         return sendImage(res, result.buffer, result.contentType, result.hit);
-
-    } catch (error) {
-        console.error(`[img/${driveId}] Error:`, error.message);
-        res.status(error.status || 502).json({ error: error.message || 'Proxy fetch failed' });
+    } catch (err1) {
+        console.warn(`[img/${driveId}] lh3 failed (${err1.message}) → trying uc fallback`);
     }
+
+    // Attempt 2 — drive.google.com/uc (chậm hơn, redirect nhiều bước)
+    const fallbackUrl = `https://drive.google.com/uc?export=view&id=${driveId}`;
+    try {
+        const result = await fetchAndCache(cacheKey, fallbackUrl);
+        console.log(`[img/${driveId}] uc fallback ${result.hit ? 'CACHE HIT' : 'OK'}`);
+        return sendImage(res, result.buffer, result.contentType, result.hit);
+    } catch (err2) {
+        console.warn(`[img/${driveId}] uc fallback also failed (${err2.message}) → returning placeholder`);
+    }
+
+    // Attempt 3 — Placeholder (không crash server, client vẫn nhận được ảnh hợp lệ)
+    res.set({
+        'Content-Type': 'image/png',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'X-Proxy-Cache': 'PLACEHOLDER',
+    });
+    return res.send(PLACEHOLDER_PNG);
 });
 
 
