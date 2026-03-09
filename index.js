@@ -2,10 +2,86 @@ const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
 const { PrismaClient } = require('@prisma/client');
+const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 
 // CDN Sync utilities (Cloudflare R2 + Supabase Storage)
 const { migrateBatchToCDN, getCDNStats, isDriveUrl } = require('./utils/cdnSync');
+
+// ─── FIREBASE ADMIN (Token Verification) ─────────────────────────────────────
+let firebaseAdmin = null;
+try {
+    const admin = require('firebase-admin');
+    if (!admin.apps.length) {
+        let credential;
+        if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+            credential = admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
+        } else {
+            const saPath = path.join(__dirname, '../functions/service-account.json');
+            if (fs.existsSync(saPath)) {
+                credential = admin.credential.cert(require(saPath));
+            }
+        }
+        if (credential) {
+            admin.initializeApp({
+                credential,
+                databaseURL: 'https://chonanh-a9d23-default-rtdb.asia-southeast1.firebasedatabase.app',
+            });
+            firebaseAdmin = admin;
+            console.log('[Auth] Firebase Admin initialized ✅');
+        } else {
+            console.warn('[Auth] No Firebase service account found. Set FIREBASE_SERVICE_ACCOUNT env var.');
+        }
+    } else {
+        firebaseAdmin = admin;
+    }
+} catch (e) {
+    console.warn('[Auth] firebase-admin not available:', e.message);
+}
+
+// ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
+async function requireAuth(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+    if (!firebaseAdmin) {
+        console.error('[Auth] Firebase Admin not initialized — rejecting request');
+        return res.status(503).json({ success: false, error: 'Auth service unavailable' });
+    }
+    const token = authHeader.slice(7);
+    try {
+        req.user = await firebaseAdmin.auth().verifyIdToken(token);
+        next();
+    } catch (err) {
+        return res.status(401).json({ success: false, error: 'Invalid or expired token' });
+    }
+}
+
+// ─── GUEST RATE LIMITER (chống spam trên public routes) ──────────────────────
+const guestHits = new Map(); // ip → { count, resetAt }
+const GUEST_LIMIT = 30;       // 30 requests
+const GUEST_WINDOW = 60_000;  // per 60 seconds
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, e] of guestHits) if (now > e.resetAt) guestHits.delete(ip);
+}, 5 * 60_000);
+
+function guestRateLimiter(req, res, next) {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const now = Date.now();
+    const e = guestHits.get(ip);
+    if (!e || now > e.resetAt) {
+        guestHits.set(ip, { count: 1, resetAt: now + GUEST_WINDOW });
+        return next();
+    }
+    if (e.count >= GUEST_LIMIT) {
+        return res.status(429).json({ success: false, error: 'Quá nhiều request. Vui lòng thử lại sau.' });
+    }
+    e.count++;
+    next();
+}
 
 const app = express();
 const prisma = new PrismaClient();
@@ -13,7 +89,26 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(compression()); // Gzip compress all responses
-app.use(cors());
+
+// CORS: Only allow requests from trusted origins
+const allowedOrigins = [
+    'http://localhost:5173',
+    'https://chonanh.thphuc.io.vn',
+];
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow server-to-server requests (no origin) and whitelisted origins
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error(`CORS blocked: origin '${origin}' is not allowed`));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
 app.use(express.json({ limit: '50mb' }));
 
 // --- ROUTES ---
@@ -39,9 +134,61 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
-// --- ALBUMS API ---
+// ─── PUBLIC: Guest Interaction Routes ───────────────────────────────────────
 
-// 1. Get All Albums
+// POST /api/photos/:id/like — Thả tim (Guest, rate-limited)
+app.post('/api/photos/:id/like', guestRateLimiter, async (req, res) => {
+    try {
+        const photo = await prisma.photo.findUnique({ where: { id: req.params.id } });
+        if (!photo) return res.status(404).json({ success: false, error: 'Photo not found' });
+        const updated = await prisma.photo.update({
+            where: { id: req.params.id },
+            data: { likeCount: (photo.likeCount || 0) + 1 },
+        });
+        res.json({ success: true, likeCount: updated.likeCount });
+    } catch (error) {
+        res.status(500).json({ success: false, error: 'Failed to like photo' });
+    }
+});
+
+// POST /api/photos/:id/comment — Bình luận (Guest, rate-limited)
+app.post('/api/photos/:id/comment', guestRateLimiter, async (req, res) => {
+    try {
+        const { text, guestName } = req.body;
+        if (!text || typeof text !== 'string' || text.trim().length === 0) {
+            return res.status(400).json({ success: false, error: 'Nội dung bình luận không được trống' });
+        }
+        if (text.trim().length > 500) {
+            return res.status(400).json({ success: false, error: 'Bình luận quá dài (tối đa 500 ký tự)' });
+        }
+        const photo = await prisma.photo.findUnique({ where: { id: req.params.id } });
+        if (!photo) return res.status(404).json({ success: false, error: 'Photo not found' });
+        const existingComments = Array.isArray(photo.comments) ? photo.comments : [];
+        const newComment = {
+            id: Date.now().toString(),
+            text: text.trim(),
+            guestName: guestName ? String(guestName).substring(0, 50).trim() : 'Khách',
+            createdAt: new Date().toISOString(),
+        };
+        const updated = await prisma.photo.update({
+            where: { id: req.params.id },
+            data: {
+                comments: [...existingComments, newComment],
+                commentCount: (photo.commentCount || 0) + 1,
+            },
+        });
+        res.status(201).json({ success: true, comment: newComment, commentCount: updated.commentCount });
+    } catch (error) {
+        res.status(500).json({ success: false, error: 'Failed to add comment' });
+    }
+});
+
+// POST /api/contact-requests — Ai cũng có thể gửi liên hệ (Guest, rate-limited)
+// NOTE: Route này được giữ public nhưng di chuyển lên đây để rõ ràng hơn.
+
+// ─── ALBUMS API ───────────────────────────────────────────────────────────────
+
+// 1. Get All Albums (PUBLIC — guest cần lấy album qua share link)
 app.get('/api/albums', async (req, res) => {
     try {
         const albums = await prisma.album.findMany({
@@ -54,8 +201,8 @@ app.get('/api/albums', async (req, res) => {
     }
 });
 
-// 2. Create Album
-app.post('/api/albums', async (req, res) => {
+// 2. Create Album [PROTECTED]
+app.post('/api/albums', requireAuth, async (req, res) => {
     try {
         const albumData = req.body;
 
@@ -114,8 +261,8 @@ app.get('/api/albums/:id', async (req, res) => {
     }
 });
 
-// 4. Update Album
-app.put('/api/albums/:id', async (req, res) => {
+// 4. Update Album [PROTECTED]
+app.put('/api/albums/:id', requireAuth, async (req, res) => {
     try {
         const updates = req.body;
 
@@ -154,8 +301,8 @@ app.put('/api/albums/:id', async (req, res) => {
     }
 });
 
-// 5. Delete Album
-app.delete('/api/albums/:id', async (req, res) => {
+// 5. Delete Album [PROTECTED]
+app.delete('/api/albums/:id', requireAuth, async (req, res) => {
     try {
         await prisma.album.delete({
             where: { id: req.params.id }
@@ -188,8 +335,8 @@ app.get('/api/albums/:albumId/photos', async (req, res) => {
     }
 });
 
-// Batch add photos
-app.post('/api/albums/:albumId/photos', async (req, res) => {
+// Batch add photos [PROTECTED]
+app.post('/api/albums/:albumId/photos', requireAuth, async (req, res) => {
     try {
         const { photos } = req.body; // Array of photo objects
         if (!photos || !Array.isArray(photos) || photos.length === 0) {
@@ -228,8 +375,8 @@ app.post('/api/albums/:albumId/photos', async (req, res) => {
     }
 });
 
-// Update single photo
-app.put('/api/photos/:id', async (req, res) => {
+// Update single photo [PROTECTED — dùng /like và /comment cho guest]
+app.put('/api/photos/:id', requireAuth, async (req, res) => {
     try {
         const updates = req.body;
         const allowedPhotoKeys = [
@@ -261,8 +408,8 @@ app.put('/api/photos/:id', async (req, res) => {
     }
 });
 
-// Batch update photos
-app.post('/api/photos/batch-update', async (req, res) => {
+// Batch update photos [PROTECTED]
+app.post('/api/photos/batch-update', requireAuth, async (req, res) => {
     try {
         const { updates } = req.body; // Array of { id, data }
         if (!updates || !Array.isArray(updates)) {
@@ -311,9 +458,9 @@ app.get('/api/photos/:id', async (req, res) => {
 
 
 
-// --- AUDIT LOGS API ---
+// ─── AUDIT LOGS API [PROTECTED] ─────────────────────────────────────────────
 
-app.get('/api/audit-logs', async (req, res) => {
+app.get('/api/audit-logs', requireAuth, async (req, res) => {
     try {
         const logs = await prisma.auditLog.findMany({
             orderBy: { timestamp: 'desc' },
@@ -326,7 +473,7 @@ app.get('/api/audit-logs', async (req, res) => {
     }
 });
 
-app.post('/api/audit-logs', async (req, res) => {
+app.post('/api/audit-logs', requireAuth, async (req, res) => {
     try {
         const logData = req.body;
 
@@ -353,9 +500,9 @@ app.post('/api/audit-logs', async (req, res) => {
     }
 });
 
-// --- NOTIFICATIONS API ---
+// ─── NOTIFICATIONS API [PROTECTED] ──────────────────────────────────────────
 
-app.get('/api/notifications', async (req, res) => {
+app.get('/api/notifications', requireAuth, async (req, res) => {
     try {
         const notifications = await prisma.notification.findMany({
             orderBy: { createdAt: 'desc' },
@@ -367,7 +514,7 @@ app.get('/api/notifications', async (req, res) => {
     }
 });
 
-app.post('/api/notifications', async (req, res) => {
+app.post('/api/notifications', requireAuth, async (req, res) => {
     try {
         const data = req.body;
         if (!data.createdAt) data.createdAt = new Date().toISOString();
@@ -378,7 +525,7 @@ app.post('/api/notifications', async (req, res) => {
     }
 });
 
-app.put('/api/notifications/:id', async (req, res) => {
+app.put('/api/notifications/:id', requireAuth, async (req, res) => {
     try {
         const notification = await prisma.notification.update({
             where: { id: req.params.id },
@@ -390,9 +537,10 @@ app.put('/api/notifications/:id', async (req, res) => {
     }
 });
 
-// --- CONTACT REQUESTS API ---
+// ─── CONTACT REQUESTS API ───────────────────────────────────────────────────
 
-app.get('/api/contact-requests', async (req, res) => {
+// GET — Admin only [PROTECTED]
+app.get('/api/contact-requests', requireAuth, async (req, res) => {
     try {
         const requests = await prisma.contactRequest.findMany({
             orderBy: { createdAt: 'desc' }
@@ -403,7 +551,8 @@ app.get('/api/contact-requests', async (req, res) => {
     }
 });
 
-app.post('/api/contact-requests', async (req, res) => {
+// POST — Public (guest gửi yêu cầu liên hệ, rate-limited)
+app.post('/api/contact-requests', guestRateLimiter, async (req, res) => {
     try {
         const data = req.body;
         if (!data.createdAt) data.createdAt = new Date().toISOString();
@@ -414,7 +563,8 @@ app.post('/api/contact-requests', async (req, res) => {
     }
 });
 
-app.put('/api/contact-requests/:id', async (req, res) => {
+// PUT/DELETE — Admin only [PROTECTED]
+app.put('/api/contact-requests/:id', requireAuth, async (req, res) => {
     try {
         const request = await prisma.contactRequest.update({
             where: { id: req.params.id },
@@ -426,7 +576,7 @@ app.put('/api/contact-requests/:id', async (req, res) => {
     }
 });
 
-app.delete('/api/contact-requests/:id', async (req, res) => {
+app.delete('/api/contact-requests/:id', requireAuth, async (req, res) => {
     try {
         await prisma.contactRequest.delete({ where: { id: req.params.id } });
         res.json({ success: true });
@@ -435,8 +585,9 @@ app.delete('/api/contact-requests/:id', async (req, res) => {
     }
 });
 
-// --- SETTINGS API ---
+// ─── SETTINGS API ────────────────────────────────────────────────────────────
 
+// GET — Public (landing page & guests cần đọc settings)
 app.get('/api/settings', async (req, res) => {
     try {
         const setting = await prisma.setting.findUnique({ where: { id: 'global' } });
@@ -447,7 +598,8 @@ app.get('/api/settings', async (req, res) => {
     }
 });
 
-app.put('/api/settings', async (req, res) => {
+// PUT — Admin only [PROTECTED]
+app.put('/api/settings', requireAuth, async (req, res) => {
     try {
         const data = req.body;
         const setting = await prisma.setting.upsert({
@@ -462,9 +614,9 @@ app.put('/api/settings', async (req, res) => {
     }
 });
 
-// --- WORKSPACES API ---
+// ─── WORKSPACES API [PROTECTED] ─────────────────────────────────────────────
 
-app.get('/api/workspaces/:userId', async (req, res) => {
+app.get('/api/workspaces/:userId', requireAuth, async (req, res) => {
     try {
         const workspaces = await prisma.workspace.findMany({
             where: { userId: req.params.userId },
@@ -477,7 +629,7 @@ app.get('/api/workspaces/:userId', async (req, res) => {
     }
 });
 
-app.post('/api/workspaces', async (req, res) => {
+app.post('/api/workspaces', requireAuth, async (req, res) => {
     try {
         const workspace = await prisma.workspace.create({ data: req.body });
         res.status(201).json({ success: true, data: workspace });
@@ -487,7 +639,7 @@ app.post('/api/workspaces', async (req, res) => {
     }
 });
 
-app.put('/api/workspaces/:id', async (req, res) => {
+app.put('/api/workspaces/:id', requireAuth, async (req, res) => {
     try {
         const workspace = await prisma.workspace.update({
             where: { id: req.params.id },
@@ -500,7 +652,7 @@ app.put('/api/workspaces/:id', async (req, res) => {
     }
 });
 
-app.delete('/api/workspaces/:id', async (req, res) => {
+app.delete('/api/workspaces/:id', requireAuth, async (req, res) => {
     try {
         await prisma.workspace.delete({ where: { id: req.params.id } });
         res.json({ success: true });
@@ -522,10 +674,10 @@ const PROXY_ALLOWED_HOSTS = [
     'docs.google.com',
 ];
 
-// In-memory cache: URL → { buffer, contentType, cachedAt }
+// In-memory cache: cacheKey → { buffer, contentType, cachedAt }
 const proxyCache = new Map();
-const PROXY_CACHE_TTL = 30 * 60 * 1000; // 30 min
-const PROXY_CACHE_MAX = 500;
+const PROXY_CACHE_TTL  = 365 * 24 * 60 * 60 * 1000; // 1 năm (ảnh Drive không đổi)
+const PROXY_CACHE_MAX  = 1000;
 
 // Evict expired entries periodically
 setInterval(() => {
@@ -533,7 +685,87 @@ setInterval(() => {
     for (const [key, val] of proxyCache) {
         if (now - val.cachedAt > PROXY_CACHE_TTL) proxyCache.delete(key);
     }
-}, 5 * 60 * 1000);
+}, 60 * 60 * 1000); // dọn dẹp mỗi 1 giờ
+
+// Helper: set image response headers
+function sendImage(res, buffer, contentType, cacheHit) {
+    res.set({
+        'Content-Type': contentType,
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Access-Control-Allow-Origin': '*',
+        'X-Proxy-Cache': cacheHit ? 'HIT' : 'MISS',
+    });
+    return res.send(buffer);
+}
+
+// Helper: fetch + validate + cache
+async function fetchAndCache(cacheKey, url, extraHeaders = {}) {
+    const cached = proxyCache.get(cacheKey);
+    if (cached) return { ...cached, hit: true };
+
+    const response = await fetch(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            'Referer': 'https://drive.google.com/',
+            ...extraHeaders,
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!response.ok) throw Object.assign(new Error(`Upstream ${response.status}`), { status: 502 });
+
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    if (contentType.includes('text/html')) throw Object.assign(new Error('Got HTML instead of image'), { status: 502 });
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    if (proxyCache.size >= PROXY_CACHE_MAX) proxyCache.delete(proxyCache.keys().next().value);
+    proxyCache.set(cacheKey, { buffer, contentType, cachedAt: Date.now() });
+    return { buffer, contentType, hit: false };
+}
+
+// ─── /api/img/:driveId — Proxy ảnh Google Drive qua drive_id (chiến lược mới) ─
+//
+// Ưu tiên thứ tự:
+//   1. lh3.googleusercontent.com/d/{driveId}=s1600  (nhanh, không cần API key)
+//   2. drive.google.com/uc?export=view&id={driveId} (fallback)
+//
+// Query params:
+//   size: width px (default 1600). Ví dụ: /api/img/abc123?size=400 → thumbnail
+app.get('/api/img/:driveId', async (req, res) => {
+    const { driveId } = req.params;
+    const size = Math.min(parseInt(req.query.size) || 1600, 4096);
+
+    // Validate driveId format (alphanumeric, hyphens, underscores only)
+    if (!/^[a-zA-Z0-9_-]{10,}$/.test(driveId)) {
+        return res.status(400).json({ error: 'Invalid driveId format' });
+    }
+
+    const cacheKey = `drive:${driveId}:${size}`;
+
+    try {
+        // Attempt 1: lh3.googleusercontent.com (không yêu cầu login nếu file là Public)
+        const primaryUrl = `https://lh3.googleusercontent.com/d/${driveId}=s${size}`;
+        try {
+            const result = await fetchAndCache(cacheKey, primaryUrl);
+            return sendImage(res, result.buffer, result.contentType, result.hit);
+        } catch (primaryErr) {
+            console.warn(`[img/${driveId}] lh3 failed (${primaryErr.message}), trying uc fallback...`);
+        }
+
+        // Attempt 2: Drive export URL
+        const fallbackUrl = `https://drive.google.com/uc?export=view&id=${driveId}`;
+        const result = await fetchAndCache(cacheKey, fallbackUrl);
+        return sendImage(res, result.buffer, result.contentType, result.hit);
+
+    } catch (error) {
+        console.error(`[img/${driveId}] Error:`, error.message);
+        res.status(error.status || 502).json({ error: error.message || 'Proxy fetch failed' });
+    }
+});
+
 
 app.get('/api/proxy-image', async (req, res) => {
     const { url } = req.query;
@@ -660,10 +892,10 @@ app.get('/api/proxy-image/:photoId', async (req, res) => {
     }
 });
 
-// ─── CDN MAINTENANCE ROUTES ───────────────────────────────────────────────────
+// ─── CDN MAINTENANCE ROUTES [PROTECTED — Admin only] ────────────────────────
 
 // GET /api/admin/cdn-status — Thống kê trạng thái migration
-app.get('/api/admin/cdn-status', async (req, res) => {
+app.get('/api/admin/cdn-status', requireAuth, async (req, res) => {
     try {
         const stats = await getCDNStats(prisma);
         res.json({ success: true, data: stats });
@@ -678,7 +910,7 @@ app.get('/api/admin/cdn-status', async (req, res) => {
 //   albumId    — chỉ migrate album cụ thể; bỏ trống = migrate toàn bộ
 //   limit      — số ảnh mỗi lần chạy (default 20)
 //   concurrency — upload song song (default 3)
-app.post('/api/admin/migrate-cdn', async (req, res) => {
+app.post('/api/admin/migrate-cdn', requireAuth, async (req, res) => {
     const { albumId, limit = 20, concurrency = 3 } = req.body || {};
     try {
         // Tìm ảnh còn Drive URL (chưa migrate)

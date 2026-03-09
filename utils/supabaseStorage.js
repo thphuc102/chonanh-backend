@@ -69,6 +69,10 @@ async function ensureBucket() {
 async function cacheImageToSupabase(sourceUrl, photoId, albumId) {
     if (!supabase) throw new Error('Supabase chưa được cấu hình');
 
+    // Ensure bucket exists before any operation
+    const ready = await ensureBucket();
+    if (!ready) throw new Error('Không thể khởi tạo bucket Supabase');
+
     const filePath = `${albumId}/${photoId}.jpg`;
 
     // Skip re-upload if already cached
