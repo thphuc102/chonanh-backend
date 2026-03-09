@@ -510,6 +510,156 @@ app.delete('/api/workspaces/:id', async (req, res) => {
     }
 });
 
+// ─── IMAGE PROXY (BYPASS CORB) ────────────────────────────────────────────────
+
+// Allowed domains for proxying — prevents SSRF
+const PROXY_ALLOWED_HOSTS = [
+    'lh3.googleusercontent.com',
+    'lh4.googleusercontent.com',
+    'lh5.googleusercontent.com',
+    'lh6.googleusercontent.com',
+    'drive.google.com',
+    'docs.google.com',
+];
+
+// In-memory cache: URL → { buffer, contentType, cachedAt }
+const proxyCache = new Map();
+const PROXY_CACHE_TTL = 30 * 60 * 1000; // 30 min
+const PROXY_CACHE_MAX = 500;
+
+// Evict expired entries periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, val] of proxyCache) {
+        if (now - val.cachedAt > PROXY_CACHE_TTL) proxyCache.delete(key);
+    }
+}, 5 * 60 * 1000);
+
+app.get('/api/proxy-image', async (req, res) => {
+    const { url } = req.query;
+    if (!url || typeof url !== 'string') {
+        return res.status(400).json({ error: 'Missing url parameter' });
+    }
+
+    // Validate URL & restrict to allowed domains
+    let parsed;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return res.status(400).json({ error: 'Invalid URL' });
+    }
+
+    if (!PROXY_ALLOWED_HOSTS.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h))) {
+        return res.status(403).json({ error: 'Domain not allowed' });
+    }
+
+    // Serve from cache if available
+    const cached = proxyCache.get(url);
+    if (cached && (Date.now() - cached.cachedAt < PROXY_CACHE_TTL)) {
+        res.set({
+            'Content-Type': cached.contentType,
+            'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
+            'X-Proxy-Cache': 'HIT',
+        });
+        return res.send(cached.buffer);
+    }
+
+    try {
+        const response = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://drive.google.com/',
+            },
+            redirect: 'follow',
+            signal: AbortSignal.timeout(15_000),
+        });
+
+        if (!response.ok) {
+            console.warn(`[proxy-image] Upstream ${response.status} for ${url.substring(0, 80)}…`);
+            return res.status(502).json({ error: `Upstream returned ${response.status}` });
+        }
+
+        const contentType = response.headers.get('content-type') || 'image/jpeg';
+
+        // Block HTML responses (Google login pages, error pages)
+        if (contentType.includes('text/html')) {
+            console.warn(`[proxy-image] Got HTML instead of image for ${url.substring(0, 80)}…`);
+            return res.status(502).json({ error: 'Upstream returned HTML, not an image' });
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        // Cache in memory (evict oldest if full)
+        if (proxyCache.size >= PROXY_CACHE_MAX) {
+            const oldestKey = proxyCache.keys().next().value;
+            proxyCache.delete(oldestKey);
+        }
+        proxyCache.set(url, { buffer, contentType, cachedAt: Date.now() });
+
+        res.set({
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
+            'X-Proxy-Cache': 'MISS',
+        });
+        res.send(buffer);
+    } catch (error) {
+        console.error(`[proxy-image] Error:`, error.message);
+        res.status(502).json({ error: 'Proxy fetch failed' });
+    }
+});
+
+// GET /api/proxy-image/:photoId — Proxy by photo ID (looks up URL from DB)
+app.get('/api/proxy-image/:photoId', async (req, res) => {
+    try {
+        const photo = await prisma.photo.findUnique({
+            where: { id: req.params.photoId },
+            select: { url: true, thumbnailLink: true },
+        });
+        if (!photo) return res.status(404).json({ error: 'Photo not found' });
+
+        const imageUrl = photo.thumbnailLink || photo.url;
+        if (!imageUrl) return res.status(404).json({ error: 'No URL for photo' });
+
+        // If already a CDN URL, redirect instead of proxying
+        if (!isDriveUrl(imageUrl)) {
+            return res.redirect(301, imageUrl);
+        }
+
+        // Proxy the Google Drive URL
+        const response = await fetch(imageUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'image/*',
+                'Referer': 'https://drive.google.com/',
+            },
+            redirect: 'follow',
+            signal: AbortSignal.timeout(15_000),
+        });
+
+        if (!response.ok) {
+            return res.status(502).json({ error: `Upstream returned ${response.status}` });
+        }
+
+        const contentType = response.headers.get('content-type') || 'image/jpeg';
+        if (contentType.includes('text/html')) {
+            return res.status(502).json({ error: 'Image URL returned HTML' });
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        res.set({
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
+        });
+        res.send(buffer);
+    } catch (error) {
+        console.error(`[proxy-image/:id] Error:`, error.message);
+        res.status(502).json({ error: 'Proxy fetch failed' });
+    }
+});
+
 // ─── CDN MAINTENANCE ROUTES ───────────────────────────────────────────────────
 
 // GET /api/admin/cdn-status — Thống kê trạng thái migration
