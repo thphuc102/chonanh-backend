@@ -166,8 +166,9 @@ app.post('/api/auth/master-login', async (req, res) => {
 
         console.log(`[master-login] SuperAdmin authenticated: ${masterAdmin.email || masterAdmin.name}`);
         // Tạo Firebase custom token để frontend signInWithCustomToken → auth.currentUser hợp lệ
-        const customToken = await firebaseAdmin.auth().createCustomToken(docSnap.id, { role: 'SuperAdmin' });
-        return res.json({ success: true, data: masterAdmin, customToken });
+        // Dùng UID cố định 'master-admin-uid' để tách biệt khỏi Firestore doc ID
+        const customToken = await firebaseAdmin.auth().createCustomToken('master-admin-uid', { role: 'SuperAdmin' });
+        return res.json({ success: true, data: masterAdmin, token: customToken });
     } catch (e) {
         console.error('[master-login] Firestore error:', e);
         return res.status(500).json({ success: false, error: 'Auth failed' });
