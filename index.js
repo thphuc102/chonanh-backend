@@ -4,6 +4,8 @@ const compression = require('compression');
 const { PrismaClient } = require('@prisma/client');
 const path = require('path');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
+const { LRUCache } = require('lru-cache');
 require('dotenv').config();
 
 // CDN Sync utilities (Cloudflare R2 + Supabase Storage)
@@ -113,6 +115,63 @@ app.use(express.json({ limit: '50mb' }));
 
 // --- ROUTES ---
 
+// ─── MASTER ADMIN AUTH [SERVER-SIDE VERIFIED] ──────────────────────────────
+// Credentials được verify tại server qua env vars — password KHÔNG bao giờ có trong JS bundle.
+app.post('/api/auth/master-login', async (req, res) => {
+    const { identifier, password } = req.body || {};
+    const expectedIdentifier = process.env.MASTER_ADMIN_IDENTIFIER;
+    const expectedPassword   = process.env.MASTER_ADMIN_PASSWORD;
+
+    if (!expectedIdentifier || !expectedPassword) {
+        return res.status(503).json({ success: false, error: 'Master auth not configured on server' });
+    }
+
+    // So sánh email lẫn username (phần trước @)
+    const shortName = expectedIdentifier.includes('@') ? expectedIdentifier.split('@')[0] : expectedIdentifier;
+    const identifierOk = identifier === expectedIdentifier || identifier === shortName;
+
+    if (!identifierOk || password !== expectedPassword) {
+        await new Promise(r => setTimeout(r, 500)); // làm chậm brute-force
+        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+
+    if (!firebaseAdmin) {
+        return res.status(503).json({ success: false, error: 'Auth service unavailable' });
+    }
+
+    try {
+        const firestoreDb = firebaseAdmin.firestore();
+        const displayName  = shortName.charAt(0).toUpperCase() + shortName.slice(1); // 'thphuc' → 'Thphuc'
+
+        let snap = await firestoreDb.collection('users').where('name', '==', 'ThPhuc').limit(1).get();
+        if (snap.empty) {
+            snap = await firestoreDb.collection('users').where('name', '==', displayName).limit(1).get();
+        }
+        if (snap.empty) {
+            snap = await firestoreDb.collection('users').where('email', '==', expectedIdentifier).limit(1).get();
+        }
+
+        if (snap.empty) {
+            return res.status(404).json({ success: false, error: 'Master user not found in Firestore' });
+        }
+
+        const docSnap    = snap.docs[0];
+        const masterAdmin = { ...docSnap.data(), id: docSnap.id, role: 'SuperAdmin' };
+
+        // Persist SuperAdmin role nếu chưa có
+        if (docSnap.data().role !== 'SuperAdmin') {
+            firestoreDb.collection('users').doc(docSnap.id).update({ role: 'SuperAdmin' })
+                .catch(e => console.error('[master-login] Failed to persist role:', e));
+        }
+
+        console.log(`[master-login] SuperAdmin authenticated: ${masterAdmin.email || masterAdmin.name}`);
+        return res.json({ success: true, data: masterAdmin });
+    } catch (e) {
+        console.error('[master-login] Firestore error:', e);
+        return res.status(500).json({ success: false, error: 'Auth failed' });
+    }
+});
+
 // Health Check
 app.get('/', (req, res) => {
     res.json({
@@ -137,16 +196,18 @@ app.get('/api/health', async (req, res) => {
 // ─── PUBLIC: Guest Interaction Routes ───────────────────────────────────────
 
 // POST /api/photos/:id/like — Thả tim (Guest, rate-limited)
+// Dùng { increment: 1 } để tránh Race Condition / Lost Update khi nhiều user like đồng thời.
 app.post('/api/photos/:id/like', guestRateLimiter, async (req, res) => {
     try {
-        const photo = await prisma.photo.findUnique({ where: { id: req.params.id } });
-        if (!photo) return res.status(404).json({ success: false, error: 'Photo not found' });
         const updated = await prisma.photo.update({
             where: { id: req.params.id },
-            data: { likeCount: (photo.likeCount || 0) + 1 },
+            data: { likeCount: { increment: 1 } },
         });
         res.json({ success: true, likeCount: updated.likeCount });
     } catch (error) {
+        if (error.code === 'P2025') {
+            return res.status(404).json({ success: false, error: 'Photo not found' });
+        }
         res.status(500).json({ success: false, error: 'Failed to like photo' });
     }
 });
@@ -165,7 +226,7 @@ app.post('/api/photos/:id/comment', guestRateLimiter, async (req, res) => {
         if (!photo) return res.status(404).json({ success: false, error: 'Photo not found' });
         const existingComments = Array.isArray(photo.comments) ? photo.comments : [];
         const newComment = {
-            id: Date.now().toString(),
+            id: randomUUID(),
             text: text.trim(),
             guestName: guestName ? String(guestName).substring(0, 50).trim() : 'Khách',
             createdAt: new Date().toISOString(),
@@ -188,8 +249,9 @@ app.post('/api/photos/:id/comment', guestRateLimiter, async (req, res) => {
 
 // ─── ALBUMS API ───────────────────────────────────────────────────────────────
 
-// 1. Get All Albums (PUBLIC — guest cần lấy album qua share link)
-app.get('/api/albums', async (req, res) => {
+// 1. Get All Albums [PROTECTED — chỉ Admin/Studio được lấy toàn bộ danh sách]
+// Guest truy cập album cụ thể qua GET /api/albums/:id (vẫn public).
+app.get('/api/albums', requireAuth, async (req, res) => {
     try {
         const albums = await prisma.album.findMany({
             orderBy: { createdAt: 'desc' }
@@ -516,9 +578,13 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
 
 app.post('/api/notifications', requireAuth, async (req, res) => {
     try {
-        const data = req.body;
-        if (!data.createdAt) data.createdAt = new Date().toISOString();
-        const notification = await prisma.notification.create({ data });
+        const ALLOWED = ['type', 'title', 'message', 'albumId', 'userId', 'read', 'createdAt'];
+        const cleanData = {};
+        for (const key of ALLOWED) {
+            if (req.body[key] !== undefined && req.body[key] !== null) cleanData[key] = req.body[key];
+        }
+        if (!cleanData.createdAt) cleanData.createdAt = new Date().toISOString();
+        const notification = await prisma.notification.create({ data: cleanData });
         res.status(201).json({ success: true, data: notification });
     } catch (error) {
         res.status(500).json({ success: false, error: "Failed to create notification" });
@@ -527,9 +593,14 @@ app.post('/api/notifications', requireAuth, async (req, res) => {
 
 app.put('/api/notifications/:id', requireAuth, async (req, res) => {
     try {
+        const ALLOWED = ['type', 'title', 'message', 'albumId', 'userId', 'read'];
+        const cleanData = {};
+        for (const key of ALLOWED) {
+            if (req.body[key] !== undefined) cleanData[key] = req.body[key];
+        }
         const notification = await prisma.notification.update({
             where: { id: req.params.id },
-            data: req.body
+            data: cleanData
         });
         res.json({ success: true, data: notification });
     } catch (error) {
@@ -554,9 +625,17 @@ app.get('/api/contact-requests', requireAuth, async (req, res) => {
 // POST — Public (guest gửi yêu cầu liên hệ, rate-limited)
 app.post('/api/contact-requests', guestRateLimiter, async (req, res) => {
     try {
-        const data = req.body;
-        if (!data.createdAt) data.createdAt = new Date().toISOString();
-        const request = await prisma.contactRequest.create({ data });
+        const ALLOWED = [
+            'userId', 'userName', 'email', 'phone', 'requestType',
+            'message', 'notes', 'planRequested', 'billingCycle',
+            'albumId', 'albumName', 'createdAt'
+        ];
+        const cleanData = {};
+        for (const key of ALLOWED) {
+            if (req.body[key] !== undefined && req.body[key] !== null) cleanData[key] = req.body[key];
+        }
+        if (!cleanData.createdAt) cleanData.createdAt = new Date().toISOString();
+        const request = await prisma.contactRequest.create({ data: cleanData });
         res.status(201).json({ success: true, data: request });
     } catch (error) {
         res.status(500).json({ success: false, error: "Failed to create contact request", details: error.message });
@@ -566,9 +645,14 @@ app.post('/api/contact-requests', guestRateLimiter, async (req, res) => {
 // PUT/DELETE — Admin only [PROTECTED]
 app.put('/api/contact-requests/:id', requireAuth, async (req, res) => {
     try {
+        const ALLOWED = ['status', 'notes', 'adminNotes', 'contactedAt', 'completedAt', 'respondedAt', 'respondedBy'];
+        const cleanData = {};
+        for (const key of ALLOWED) {
+            if (req.body[key] !== undefined) cleanData[key] = req.body[key];
+        }
         const request = await prisma.contactRequest.update({
             where: { id: req.params.id },
-            data: req.body
+            data: cleanData
         });
         res.json({ success: true, data: request });
     } catch (error) {
@@ -631,7 +715,13 @@ app.get('/api/workspaces/:userId', requireAuth, async (req, res) => {
 
 app.post('/api/workspaces', requireAuth, async (req, res) => {
     try {
-        const workspace = await prisma.workspace.create({ data: req.body });
+        const ALLOWED = ['userId', 'name', 'color', 'createdAt'];
+        const cleanData = {};
+        for (const key of ALLOWED) {
+            if (req.body[key] !== undefined && req.body[key] !== null) cleanData[key] = req.body[key];
+        }
+        if (!cleanData.createdAt) cleanData.createdAt = new Date().toISOString();
+        const workspace = await prisma.workspace.create({ data: cleanData });
         res.status(201).json({ success: true, data: workspace });
     } catch (error) {
         console.error("Error creating workspace:", error);
@@ -641,9 +731,14 @@ app.post('/api/workspaces', requireAuth, async (req, res) => {
 
 app.put('/api/workspaces/:id', requireAuth, async (req, res) => {
     try {
+        const ALLOWED = ['name', 'color'];
+        const cleanData = {};
+        for (const key of ALLOWED) {
+            if (req.body[key] !== undefined) cleanData[key] = req.body[key];
+        }
         const workspace = await prisma.workspace.update({
             where: { id: req.params.id },
-            data: req.body
+            data: cleanData
         });
         res.json({ success: true, data: workspace });
     } catch (error) {
@@ -674,18 +769,15 @@ const PROXY_ALLOWED_HOSTS = [
     'docs.google.com',
 ];
 
-// In-memory cache: cacheKey → { buffer, contentType, cachedAt }
-const proxyCache = new Map();
-const PROXY_CACHE_TTL  = 365 * 24 * 60 * 60 * 1000; // 1 năm (ảnh Drive không đổi)
-const PROXY_CACHE_MAX  = 1000;
-
-// Evict expired entries periodically
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, val] of proxyCache) {
-        if (now - val.cachedAt > PROXY_CACHE_TTL) proxyCache.delete(key);
-    }
-}, 60 * 60 * 1000); // dọn dẹp mỗi 1 giờ
+// In-memory image cache — giới hạn CỨNG 200MB để chống OOM trên Render free tier.
+// LRUCache tự động evict entry cũ nhất khi vượt maxSize; TTL xử lý hết hạn.
+const PROXY_CACHE_TTL = 365 * 24 * 60 * 60 * 1000; // 1 năm
+const proxyCache = new LRUCache({
+    maxSize: 200 * 1024 * 1024,           // 200MB hard limit (tính theo bytes)
+    sizeCalculation: (entry) => entry.buffer.length,
+    ttl: PROXY_CACHE_TTL,
+    allowStale: false,
+});
 
 // Helper: set image response headers
 function sendImage(res, buffer, contentType, cacheHit) {
@@ -729,8 +821,7 @@ async function fetchAndCache(cacheKey, url, extraHeaders = {}) {
 
     const buffer = Buffer.from(await response.arrayBuffer());
 
-    if (proxyCache.size >= PROXY_CACHE_MAX) proxyCache.delete(proxyCache.keys().next().value);
-    proxyCache.set(cacheKey, { buffer, contentType, cachedAt: Date.now() });
+    proxyCache.set(cacheKey, { buffer, contentType });
     return { buffer, contentType, hit: false };
 }
 
@@ -813,9 +904,9 @@ app.get('/api/proxy-image', async (req, res) => {
         return res.status(403).json({ error: 'Domain not allowed' });
     }
 
-    // Serve from cache if available
+    // Serve from cache if available (LRUCache handles TTL automatically)
     const cached = proxyCache.get(url);
-    if (cached && (Date.now() - cached.cachedAt < PROXY_CACHE_TTL)) {
+    if (cached) {
         res.set({
             'Content-Type': cached.contentType,
             'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
@@ -852,12 +943,7 @@ app.get('/api/proxy-image', async (req, res) => {
         const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
 
-        // Cache in memory (evict oldest if full)
-        if (proxyCache.size >= PROXY_CACHE_MAX) {
-            const oldestKey = proxyCache.keys().next().value;
-            proxyCache.delete(oldestKey);
-        }
-        proxyCache.set(url, { buffer, contentType, cachedAt: Date.now() });
+        proxyCache.set(url, { buffer, contentType });
 
         res.set({
             'Content-Type': contentType,
