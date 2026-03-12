@@ -165,10 +165,55 @@ app.post('/api/auth/master-login', async (req, res) => {
         }
 
         console.log(`[master-login] SuperAdmin authenticated: ${masterAdmin.email || masterAdmin.name}`);
-        return res.json({ success: true, data: masterAdmin });
+        // Tạo Firebase custom token để frontend signInWithCustomToken → auth.currentUser hợp lệ
+        const customToken = await firebaseAdmin.auth().createCustomToken(docSnap.id, { role: 'SuperAdmin' });
+        return res.json({ success: true, data: masterAdmin, customToken });
     } catch (e) {
         console.error('[master-login] Firestore error:', e);
         return res.status(500).json({ success: false, error: 'Auth failed' });
+    }
+});
+
+// POST /api/auth/user-login — Server-side Firestore credential check + Firebase custom token
+// Moves password verification server-side so apiFetch receives a real Firebase ID token.
+app.post('/api/auth/user-login', async (req, res) => {
+    const { identifier, password } = req.body || {};
+    if (!identifier || !password) {
+        return res.status(400).json({ success: false, error: 'Credentials required' });
+    }
+    if (!firebaseAdmin) {
+        return res.status(503).json({ success: false, error: 'Auth service unavailable' });
+    }
+    try {
+        const firestoreDb = firebaseAdmin.firestore();
+        let foundDoc = null;
+
+        // Lookup by email first, then by display name
+        const emailSnap = await firestoreDb.collection('users').where('email', '==', identifier).limit(1).get();
+        if (!emailSnap.empty) {
+            foundDoc = emailSnap.docs[0];
+        } else {
+            const nameSnap = await firestoreDb.collection('users').where('name', '==', identifier).limit(1).get();
+            if (!nameSnap.empty) foundDoc = nameSnap.docs[0];
+        }
+
+        if (!foundDoc) {
+            await new Promise(r => setTimeout(r, 400)); // slow brute-force
+            return res.status(401).json({ success: false, error: 'Invalid credentials' });
+        }
+
+        const userData = foundDoc.data();
+        if (userData.password !== password) {
+            await new Promise(r => setTimeout(r, 400));
+            return res.status(401).json({ success: false, error: 'Invalid credentials' });
+        }
+
+        const foundUser = { ...userData, id: foundDoc.id };
+        const customToken = await firebaseAdmin.auth().createCustomToken(foundDoc.id, { role: foundUser.role });
+        return res.json({ success: true, data: foundUser, customToken });
+    } catch (e) {
+        console.error('[user-login] Error:', e);
+        return res.status(500).json({ success: false, error: 'Login failed' });
     }
 });
 
@@ -212,8 +257,8 @@ app.post('/api/photos/:id/like', guestRateLimiter, async (req, res) => {
     }
 });
 
-// POST /api/photos/:id/comment — Bình luận (Guest, rate-limited)
-app.post('/api/photos/:id/comment', guestRateLimiter, async (req, res) => {
+// W-01: Atomic comment append — PostgreSQL jsonb || operator, no GET-modify-PUT pattern
+async function handleAddComment(req, res) {
     try {
         const { text, guestName } = req.body;
         if (!text || typeof text !== 'string' || text.trim().length === 0) {
@@ -222,27 +267,35 @@ app.post('/api/photos/:id/comment', guestRateLimiter, async (req, res) => {
         if (text.trim().length > 500) {
             return res.status(400).json({ success: false, error: 'Bình luận quá dài (tối đa 500 ký tự)' });
         }
-        const photo = await prisma.photo.findUnique({ where: { id: req.params.id } });
-        if (!photo) return res.status(404).json({ success: false, error: 'Photo not found' });
-        const existingComments = Array.isArray(photo.comments) ? photo.comments : [];
         const newComment = {
             id: randomUUID(),
             text: text.trim(),
             guestName: guestName ? String(guestName).substring(0, 50).trim() : 'Khách',
             createdAt: new Date().toISOString(),
         };
-        const updated = await prisma.photo.update({
-            where: { id: req.params.id },
-            data: {
-                comments: [...existingComments, newComment],
-                commentCount: (photo.commentCount || 0) + 1,
-            },
-        });
-        res.status(201).json({ success: true, comment: newComment, commentCount: updated.commentCount });
+        // Single atomic UPDATE with PostgreSQL jsonb concatenation — no prior read needed
+        const rows = await prisma.$queryRaw`
+            UPDATE "Photo"
+            SET
+                "comments"     = COALESCE("comments", '[]'::jsonb) || ${JSON.stringify([newComment])}::jsonb,
+                "commentCount" = COALESCE("commentCount", 0) + 1
+            WHERE "id" = ${req.params.id}
+            RETURNING "commentCount"
+        `;
+        if (!rows || rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Photo not found' });
+        }
+        res.status(201).json({ success: true, comment: newComment, commentCount: Number(rows[0].commentCount) });
     } catch (error) {
+        console.error('Error adding comment:', error);
         res.status(500).json({ success: false, error: 'Failed to add comment' });
     }
-});
+}
+
+// POST — kept for backward compatibility
+app.post('/api/photos/:id/comment', guestRateLimiter, handleAddComment);
+// PATCH — new semantic endpoint (W-01)
+app.patch('/api/photos/:id/comment', guestRateLimiter, handleAddComment);
 
 // POST /api/contact-requests — Ai cũng có thể gửi liên hệ (Guest, rate-limited)
 // NOTE: Route này được giữ public nhưng di chuyển lên đây để rõ ràng hơn.
@@ -473,7 +526,7 @@ app.put('/api/photos/:id', requireAuth, async (req, res) => {
 // Batch update photos [PROTECTED]
 app.post('/api/photos/batch-update', requireAuth, async (req, res) => {
     try {
-        const { updates } = req.body; // Array of { id, data }
+        const { updates } = req.body;
         if (!updates || !Array.isArray(updates)) {
             return res.status(400).json({ success: false, error: "Invalid updates format" });
         }
@@ -484,23 +537,51 @@ app.post('/api/photos/batch-update', requireAuth, async (req, res) => {
             'likes', 'likeCount'
         ];
 
-        const results = await prisma.$transaction(
-            updates.map(u => {
-                const cleanData = {};
-                for (const key of allowedPhotoKeys) {
-                    if (u.data[key] !== undefined) {
-                        cleanData[key] = u.data[key];
-                    }
-                }
-                delete cleanData.id;
-                return prisma.photo.update({
-                    where: { id: u.id },
-                    data: cleanData
-                });
-            })
-        );
+        // W-07: Chunk into 100-item batches to avoid locking the DB on large payloads
+        const CHUNK_SIZE = 100;
+        let totalCount = 0;
+        const chunkErrors = [];
 
-        res.json({ success: true, count: results.length });
+        for (let i = 0; i < updates.length; i += CHUNK_SIZE) {
+            const chunk = updates.slice(i, i + CHUNK_SIZE);
+            try {
+                const results = await prisma.$transaction(
+                    chunk.map(u => {
+                        const cleanData = {};
+                        for (const key of allowedPhotoKeys) {
+                            if (u.data[key] !== undefined) {
+                                cleanData[key] = u.data[key];
+                            }
+                        }
+                        delete cleanData.id;
+                        return prisma.photo.update({
+                            where: { id: u.id },
+                            data: cleanData
+                        });
+                    })
+                );
+                totalCount += results.length;
+            } catch (chunkError) {
+                const chunkIdx = Math.floor(i / CHUNK_SIZE) + 1;
+                console.error(`Batch update chunk ${chunkIdx} (items ${i}-${i + chunk.length - 1}) failed:`, chunkError);
+                chunkErrors.push({
+                    chunkStart: i,
+                    chunkEnd: i + chunk.length - 1,
+                    error: chunkError.message
+                });
+            }
+        }
+
+        if (chunkErrors.length > 0) {
+            return res.status(207).json({
+                success: false,
+                count: totalCount,
+                errors: chunkErrors,
+                message: `${totalCount} updated, ${chunkErrors.length} chunk(s) failed`
+            });
+        }
+
+        res.json({ success: true, count: totalCount });
     } catch (error) {
         console.error("Error batch updating photos:", error);
         res.status(500).json({ success: false, error: "Failed to batch update", details: error.message });
