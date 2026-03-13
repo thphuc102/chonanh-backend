@@ -112,17 +112,40 @@ function decodePhotoCursor(rawCursor) {
 // Middleware
 app.use(compression()); // Gzip compress all responses
 
-// CORS: Only allow requests from trusted origins
-const allowedOrigins = [
+// CORS: allow trusted origins + Firebase Hosting domains (web.app/firebaseapp.com)
+const staticAllowedOrigins = [
     'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
     'https://chonanh.thphuc.io.vn',
 ];
+
+const envAllowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+
+const allowedOrigins = [...new Set([...staticAllowedOrigins, ...envAllowedOrigins])];
+
+function isAllowedOrigin(origin) {
+    if (!origin) return true; // server-to-server/no-origin
+
+    if (allowedOrigins.includes(origin)) return true;
+
+    // Firebase Hosting default domains
+    if (/^https:\/\/[a-z0-9-]+\.web\.app$/i.test(origin)) return true;
+    if (/^https:\/\/[a-z0-9-]+\.firebaseapp\.com$/i.test(origin)) return true;
+
+    return false;
+}
+
 app.use(cors({
     origin: (origin, callback) => {
-        // Allow server-to-server requests (no origin) and whitelisted origins
-        if (!origin || allowedOrigins.includes(origin)) {
+        if (isAllowedOrigin(origin)) {
             callback(null, true);
         } else {
+            console.warn(`[CORS] Blocked origin: ${origin}`);
             callback(new Error(`CORS blocked: origin '${origin}' is not allowed`));
         }
     },
