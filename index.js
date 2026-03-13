@@ -89,6 +89,26 @@ const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 5000;
 
+const PHOTO_PAGE_DEFAULT_LIMIT = 50;
+const PHOTO_PAGE_MAX_LIMIT = 100;
+
+function encodePhotoCursor(cursor) {
+    return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+function decodePhotoCursor(rawCursor) {
+    try {
+        const decoded = Buffer.from(rawCursor, 'base64url').toString('utf8');
+        const parsed = JSON.parse(decoded);
+        if (!parsed || typeof parsed.createdAt !== 'string' || typeof parsed.id !== 'string') {
+            return null;
+        }
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
 // Middleware
 app.use(compression()); // Gzip compress all responses
 
@@ -258,38 +278,122 @@ app.post('/api/photos/:id/like', guestRateLimiter, async (req, res) => {
     }
 });
 
+function buildAtomicCommentPayload(req) {
+    const body = req.body || {};
+    const rawContent = typeof body.content === 'string' ? body.content : (typeof body.text === 'string' ? body.text : '');
+    const content = rawContent.trim();
+    if (!content) {
+        return { error: 'Nội dung bình luận không được trống' };
+    }
+    if (content.length > 500) {
+        return { error: 'Bình luận quá dài (tối đa 500 ký tự)' };
+    }
+
+    const userName = String(body.userName || body.guestName || 'Khách').trim().slice(0, 80) || 'Khách';
+    const role = ['Admin', 'User', 'Customer'].includes(body.role) ? body.role : 'Customer';
+
+    const comment = {
+        id: randomUUID(),
+        userId: body.userId ? String(body.userId).slice(0, 120) : undefined,
+        userName,
+        userAvatar: body.userAvatar ? String(body.userAvatar).slice(0, 2000) : '',
+        content,
+        createdAt: new Date().toISOString(),
+        role,
+        attachmentUrl: body.attachmentUrl ? String(body.attachmentUrl).slice(0, 2000) : undefined,
+        audioUrl: body.audioUrl ? String(body.audioUrl).slice(0, 2000) : undefined,
+        audioDuration: Number.isFinite(Number(body.audioDuration)) ? Number(body.audioDuration) : undefined,
+    };
+
+    return { comment };
+}
+
+async function appendCommentAtomic(photoId, comment) {
+    const rows = await prisma.$queryRaw`
+        UPDATE "Photo"
+        SET
+            "comments"     = COALESCE("comments", '[]'::jsonb) || ${JSON.stringify([comment])}::jsonb,
+            "commentCount" = COALESCE("commentCount", 0) + 1
+        WHERE "id" = ${photoId}
+        RETURNING "commentCount"
+    `;
+    return rows;
+}
+
 // W-01: Atomic comment append — PostgreSQL jsonb || operator, no GET-modify-PUT pattern
 async function handleAddComment(req, res) {
     try {
-        const { text, guestName } = req.body;
-        if (!text || typeof text !== 'string' || text.trim().length === 0) {
-            return res.status(400).json({ success: false, error: 'Nội dung bình luận không được trống' });
+        const built = buildAtomicCommentPayload(req);
+        if (built.error) {
+            return res.status(400).json({ success: false, error: built.error });
         }
-        if (text.trim().length > 500) {
-            return res.status(400).json({ success: false, error: 'Bình luận quá dài (tối đa 500 ký tự)' });
-        }
-        const newComment = {
-            id: randomUUID(),
-            text: text.trim(),
-            guestName: guestName ? String(guestName).substring(0, 50).trim() : 'Khách',
-            createdAt: new Date().toISOString(),
-        };
-        // Single atomic UPDATE with PostgreSQL jsonb concatenation — no prior read needed
-        const rows = await prisma.$queryRaw`
-            UPDATE "Photo"
-            SET
-                "comments"     = COALESCE("comments", '[]'::jsonb) || ${JSON.stringify([newComment])}::jsonb,
-                "commentCount" = COALESCE("commentCount", 0) + 1
-            WHERE "id" = ${req.params.id}
-            RETURNING "commentCount"
-        `;
+
+        const rows = await appendCommentAtomic(req.params.id, built.comment);
         if (!rows || rows.length === 0) {
             return res.status(404).json({ success: false, error: 'Photo not found' });
         }
-        res.status(201).json({ success: true, comment: newComment, commentCount: Number(rows[0].commentCount) });
+        res.status(201).json({ success: true, comment: built.comment, commentCount: Number(rows[0].commentCount) });
     } catch (error) {
         console.error('Error adding comment:', error);
         res.status(500).json({ success: false, error: 'Failed to add comment' });
+    }
+}
+
+async function handleDeleteComment(req, res) {
+    try {
+        const photoId = req.params.id;
+        const commentId = String(req.params.commentId || '').trim();
+
+        if (!commentId) {
+            return res.status(400).json({ success: false, error: 'commentId is required' });
+        }
+
+        const result = await prisma.$transaction(async (tx) => {
+            const rows = await tx.$queryRaw`
+                SELECT "comments"
+                FROM "Photo"
+                WHERE "id" = ${photoId}
+                FOR UPDATE
+            `;
+
+            if (!rows || rows.length === 0) {
+                return { notFound: true };
+            }
+
+            const currentComments = Array.isArray(rows[0].comments) ? rows[0].comments : [];
+            const nextComments = currentComments.filter((c) => c && String(c.id) !== commentId);
+
+            if (nextComments.length === currentComments.length) {
+                return { notFoundComment: true };
+            }
+
+            const updated = await tx.photo.update({
+                where: { id: photoId },
+                data: {
+                    comments: nextComments,
+                    commentCount: nextComments.length,
+                },
+                select: { commentCount: true },
+            });
+
+            return { updated };
+        });
+
+        if (result.notFound) {
+            return res.status(404).json({ success: false, error: 'Photo not found' });
+        }
+        if (result.notFoundComment) {
+            return res.status(404).json({ success: false, error: 'Comment not found' });
+        }
+
+        return res.json({
+            success: true,
+            deletedCommentId: commentId,
+            commentCount: Number(result.updated.commentCount),
+        });
+    } catch (error) {
+        console.error('Error deleting comment:', error);
+        return res.status(500).json({ success: false, error: 'Failed to delete comment' });
     }
 }
 
@@ -297,6 +401,10 @@ async function handleAddComment(req, res) {
 app.post('/api/photos/:id/comment', guestRateLimiter, handleAddComment);
 // PATCH — new semantic endpoint (W-01)
 app.patch('/api/photos/:id/comment', guestRateLimiter, handleAddComment);
+// POST — atomic create comment endpoint (Sprint 1)
+app.post('/api/photos/:id/comments', guestRateLimiter, handleAddComment);
+// DELETE — atomic delete comment endpoint (Sprint 1)
+app.delete('/api/photos/:id/comments/:commentId', guestRateLimiter, handleDeleteComment);
 
 // POST /api/contact-requests — Ai cũng có thể gửi liên hệ (Guest, rate-limited)
 // NOTE: Route này được giữ public nhưng di chuyển lên đây để rõ ràng hơn.
@@ -438,13 +546,58 @@ app.delete('/api/albums/:id', requireAuth, async (req, res) => {
 // Get photos by album
 app.get('/api/albums/:albumId/photos', async (req, res) => {
     try {
+        const rawLimit = Number(req.query.limit);
+        const limit = Number.isFinite(rawLimit)
+            ? Math.min(Math.max(Math.floor(rawLimit), 1), PHOTO_PAGE_MAX_LIMIT)
+            : PHOTO_PAGE_DEFAULT_LIMIT;
+
+        let cursor = null;
+        if (typeof req.query.cursor === 'string' && req.query.cursor.trim().length > 0) {
+            cursor = decodePhotoCursor(req.query.cursor);
+            if (!cursor) {
+                return res.status(400).json({ success: false, error: 'Invalid cursor' });
+            }
+        }
+
         const photos = await prisma.photo.findMany({
-            where: { albumId: req.params.albumId },
-            orderBy: { createdAt: 'desc' }
+            where: {
+                albumId: req.params.albumId,
+                ...(cursor
+                    ? {
+                        OR: [
+                            { createdAt: { lt: cursor.createdAt } },
+                            { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+                        ],
+                    }
+                    : {}),
+            },
+            orderBy: [
+                { createdAt: 'desc' },
+                { id: 'desc' },
+            ],
+            take: limit + 1,
         });
+
+        const hasMore = photos.length > limit;
+        const data = hasMore ? photos.slice(0, limit) : photos;
+        const last = data[data.length - 1];
+        const nextCursor = hasMore && last
+            ? encodePhotoCursor({ createdAt: last.createdAt || '', id: last.id })
+            : null;
+
         // Cache for 30 seconds on client to reduce repeated fetches
         res.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
-        res.json({ success: true, count: photos.length, data: photos });
+        res.json({
+            success: true,
+            count: data.length,
+            data,
+            pagination: {
+                limit,
+                hasMore,
+                nextCursor,
+            },
+            nextCursor,
+        });
     } catch (error) {
         console.error("Error fetching photos:", error);
         res.status(500).json({ success: false, error: "Failed to fetch photos" });
