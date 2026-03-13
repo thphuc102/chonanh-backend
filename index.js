@@ -9,7 +9,7 @@ const { LRUCache } = require('lru-cache');
 require('dotenv').config();
 
 // CDN Sync utilities (Cloudflare R2 + Supabase Storage)
-const { migrateBatchToCDN, getCDNStats, isDriveUrl } = require('./utils/cdnSync');
+const { migrateBatchToCDN, getCDNStats } = require('./utils/cdnSync');
 
 // ─── FIREBASE ADMIN (Token Verification) ─────────────────────────────────────
 let firebaseAdmin = null;
@@ -94,7 +94,9 @@ async function requireAuth(req, res, next) {
         console.error('[Auth] Firebase Admin not initialized — rejecting request');
         return res.status(503).json({ success: false, error: 'Auth service unavailable', details: authInitIssue || null });
     }
+
     const token = authHeader.slice(7);
+
     try {
         req.user = await firebaseAdmin.auth().verifyIdToken(token);
         next();
@@ -149,6 +151,29 @@ function decodePhotoCursor(rawCursor) {
     } catch {
         return null;
     }
+}
+
+function extractDriveIdFromUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return null;
+
+    const lh3Match = rawUrl.match(/googleusercontent\.com\/d\/([a-zA-Z0-9_-]+)/);
+    if (lh3Match) return lh3Match[1];
+
+    const fileMatch = rawUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+    if (fileMatch) return fileMatch[1];
+
+    try {
+        const parsed = new URL(rawUrl);
+        const id = parsed.searchParams.get('id');
+        if (id) return id;
+    } catch {
+        // ignore malformed URLs
+    }
+
+    const queryIdMatch = rawUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    if (queryIdMatch) return queryIdMatch[1];
+
+    return null;
 }
 
 // Middleware
@@ -644,7 +669,16 @@ app.get('/api/albums/:albumId/photos', async (req, res) => {
         });
 
         const hasMore = photos.length > limit;
-        const data = hasMore ? photos.slice(0, limit) : photos;
+        const rawData = hasMore ? photos.slice(0, limit) : photos;
+        const data = rawData.map((photo) => {
+            const sourceUrl = photo.url || photo.thumbnailLink || '';
+            const driveId = extractDriveIdFromUrl(sourceUrl);
+            return {
+                ...photo,
+                driveId,
+                rawUrl: photo.url || null,
+            };
+        });
         const last = data[data.length - 1];
         const nextCursor = hasMore && last
             ? encodePhotoCursor({ createdAt: last.createdAt || '', id: last.id })
@@ -1059,16 +1093,6 @@ app.delete('/api/workspaces/:id', requireAuth, async (req, res) => {
 
 // ─── IMAGE PROXY (BYPASS CORB) ────────────────────────────────────────────────
 
-// Allowed domains for proxying — prevents SSRF
-const PROXY_ALLOWED_HOSTS = [
-    'lh3.googleusercontent.com',
-    'lh4.googleusercontent.com',
-    'lh5.googleusercontent.com',
-    'lh6.googleusercontent.com',
-    'drive.google.com',
-    'docs.google.com',
-];
-
 // In-memory image cache — giới hạn CỨNG 200MB để chống OOM trên Render free tier.
 // LRUCache tự động evict entry cũ nhất khi vượt maxSize; TTL xử lý hết hạn.
 const PROXY_CACHE_TTL = 365 * 24 * 60 * 60 * 1000; // 1 năm
@@ -1187,123 +1211,18 @@ app.get('/api/img/:driveId', async (req, res) => {
 
 
 app.get('/api/proxy-image', async (req, res) => {
-    const { url } = req.query;
-    if (!url || typeof url !== 'string') {
-        return res.status(400).json({ error: 'Missing url parameter' });
-    }
-
-    // Validate URL & restrict to allowed domains
-    let parsed;
-    try {
-        parsed = new URL(url);
-    } catch {
-        return res.status(400).json({ error: 'Invalid URL' });
-    }
-
-    if (!PROXY_ALLOWED_HOSTS.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h))) {
-        return res.status(403).json({ error: 'Domain not allowed' });
-    }
-
-    // Serve from cache if available (LRUCache handles TTL automatically)
-    const cached = proxyCache.get(url);
-    if (cached) {
-        res.set({
-            'Content-Type': cached.contentType,
-            'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
-            'X-Proxy-Cache': 'HIT',
-        });
-        return res.send(cached.buffer);
-    }
-
-    try {
-        const response = await fetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://drive.google.com/',
-            },
-            redirect: 'follow',
-            signal: AbortSignal.timeout(15_000),
-        });
-
-        if (!response.ok) {
-            console.warn(`[proxy-image] Upstream ${response.status} for ${url.substring(0, 80)}…`);
-            return res.status(502).json({ error: `Upstream returned ${response.status}` });
-        }
-
-        const contentType = response.headers.get('content-type') || 'image/jpeg';
-
-        // Block HTML responses (Google login pages, error pages)
-        if (contentType.includes('text/html')) {
-            console.warn(`[proxy-image] Got HTML instead of image for ${url.substring(0, 80)}…`);
-            return res.status(502).json({ error: 'Upstream returned HTML, not an image' });
-        }
-
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-
-        proxyCache.set(url, { buffer, contentType });
-
-        res.set({
-            'Content-Type': contentType,
-            'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
-            'X-Proxy-Cache': 'MISS',
-        });
-        res.send(buffer);
-    } catch (error) {
-        console.error(`[proxy-image] Error:`, error.message);
-        res.status(502).json({ error: 'Proxy fetch failed' });
-    }
+    return res.status(410).json({
+        success: false,
+        error: 'Endpoint deprecated. Use direct Cloudflare Worker URL.',
+    });
 });
 
 // GET /api/proxy-image/:photoId — Proxy by photo ID (looks up URL from DB)
 app.get('/api/proxy-image/:photoId', async (req, res) => {
-    try {
-        const photo = await prisma.photo.findUnique({
-            where: { id: req.params.photoId },
-            select: { url: true, thumbnailLink: true },
-        });
-        if (!photo) return res.status(404).json({ error: 'Photo not found' });
-
-        const imageUrl = photo.thumbnailLink || photo.url;
-        if (!imageUrl) return res.status(404).json({ error: 'No URL for photo' });
-
-        // If already a CDN URL, redirect instead of proxying
-        if (!isDriveUrl(imageUrl)) {
-            return res.redirect(301, imageUrl);
-        }
-
-        // Proxy the Google Drive URL
-        const response = await fetch(imageUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'image/*',
-                'Referer': 'https://drive.google.com/',
-            },
-            redirect: 'follow',
-            signal: AbortSignal.timeout(15_000),
-        });
-
-        if (!response.ok) {
-            return res.status(502).json({ error: `Upstream returned ${response.status}` });
-        }
-
-        const contentType = response.headers.get('content-type') || 'image/jpeg';
-        if (contentType.includes('text/html')) {
-            return res.status(502).json({ error: 'Image URL returned HTML' });
-        }
-
-        const buffer = Buffer.from(await response.arrayBuffer());
-        res.set({
-            'Content-Type': contentType,
-            'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
-        });
-        res.send(buffer);
-    } catch (error) {
-        console.error(`[proxy-image/:id] Error:`, error.message);
-        res.status(502).json({ error: 'Proxy fetch failed' });
-    }
+    return res.status(410).json({
+        success: false,
+        error: 'Endpoint deprecated. Use direct Cloudflare Worker URL.',
+    });
 });
 
 // ─── CDN MAINTENANCE ROUTES [PROTECTED — Admin only] ────────────────────────
