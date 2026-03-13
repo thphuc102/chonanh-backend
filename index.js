@@ -15,6 +15,7 @@ const { migrateBatchToCDN, getCDNStats, isDriveUrl } = require('./utils/cdnSync'
 let firebaseAdmin = null;
 let firebaseAdminProjectId = null;
 const EXPECTED_FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'chonanh-a9d23';
+let authInitIssue = null;
 try {
     const admin = require('firebase-admin');
     if (!admin.apps.length) {
@@ -41,18 +42,21 @@ try {
             if (firebaseAdminProjectId && firebaseAdminProjectId !== EXPECTED_FIREBASE_PROJECT_ID) {
                 console.error(`[Auth] Firebase project mismatch ❌ expected=${EXPECTED_FIREBASE_PROJECT_ID} actual=${firebaseAdminProjectId}`);
                 console.error('[Auth] Refusing to issue custom tokens to prevent INVALID_CUSTOM_TOKEN/CREDENTIAL_MISMATCH.');
+                authInitIssue = `Firebase project mismatch: expected=${EXPECTED_FIREBASE_PROJECT_ID}, actual=${firebaseAdminProjectId}`;
                 firebaseAdmin = null;
             }
 
             console.log('[Auth] Firebase Admin initialized ✅');
         } else {
             console.warn('[Auth] No Firebase service account found. Set FIREBASE_SERVICE_ACCOUNT env var.');
+            authInitIssue = 'No Firebase service account found';
         }
     } else {
         firebaseAdmin = admin;
     }
 } catch (e) {
     console.warn('[Auth] firebase-admin not available:', e.message);
+    authInitIssue = `firebase-admin init error: ${e.message}`;
 }
 
 // ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
@@ -63,7 +67,7 @@ async function requireAuth(req, res, next) {
     }
     if (!firebaseAdmin) {
         console.error('[Auth] Firebase Admin not initialized — rejecting request');
-        return res.status(503).json({ success: false, error: 'Auth service unavailable' });
+        return res.status(503).json({ success: false, error: 'Auth service unavailable', details: authInitIssue || null });
     }
     const token = authHeader.slice(7);
     try {
@@ -192,7 +196,7 @@ app.post('/api/auth/master-login', async (req, res) => {
     }
 
     if (!firebaseAdmin) {
-        return res.status(503).json({ success: false, error: 'Auth service unavailable' });
+        return res.status(503).json({ success: false, error: 'Auth service unavailable', details: authInitIssue || null });
     }
 
     try {
@@ -239,7 +243,7 @@ app.post('/api/auth/user-login', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Credentials required' });
     }
     if (!firebaseAdmin) {
-        return res.status(503).json({ success: false, error: 'Auth service unavailable' });
+        return res.status(503).json({ success: false, error: 'Auth service unavailable', details: authInitIssue || null });
     }
     try {
         const firestoreDb = firebaseAdmin.firestore();
