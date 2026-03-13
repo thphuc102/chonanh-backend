@@ -260,7 +260,7 @@ app.use(express.json({ limit: '50mb' }));
 // Credentials được verify tại server qua env vars — password KHÔNG bao giờ có trong JS bundle.
 app.post('/api/auth/master-login', async (req, res) => {
     const { identifier, password } = req.body || {};
-    const expectedIdentifier = process.env.MASTER_ADMIN_IDENTIFIER;
+    const expectedIdentifier = process.env.MASTER_ADMIN_IDENTIFIER; // This should be an email
     const expectedPassword   = process.env.MASTER_ADMIN_PASSWORD;
 
     if (!expectedIdentifier || !expectedPassword) {
@@ -282,37 +282,54 @@ app.post('/api/auth/master-login', async (req, res) => {
 
     try {
         const firestoreDb = firebaseAdmin.firestore();
-        const displayName  = shortName.charAt(0).toUpperCase() + shortName.slice(1); // 'thphuc' → 'Thphuc'
+        const auth = firebaseAdmin.auth();
 
-        let snap = await firestoreDb.collection('users').where('name', '==', 'ThPhuc').limit(1).get();
-        if (snap.empty) {
-            snap = await firestoreDb.collection('users').where('name', '==', displayName).limit(1).get();
-        }
-        if (snap.empty) {
-            snap = await firestoreDb.collection('users').where('email', '==', expectedIdentifier).limit(1).get();
-        }
+        // Find user in Firestore by email
+        const userQuery = await firestoreDb.collection('users').where('email', '==', expectedIdentifier).limit(1).get();
 
-        if (snap.empty) {
+        if (userQuery.empty) {
             return res.status(404).json({ success: false, error: 'Master user not found in Firestore' });
         }
 
-        const docSnap    = snap.docs[0];
-        const masterAdmin = { ...docSnap.data(), id: docSnap.id, role: 'SuperAdmin' };
+        const userDoc = userQuery.docs[0];
+        const userData = userDoc.data();
+        const userId = userDoc.id;
+        const userEmail = userData.email;
 
-        // Persist SuperAdmin role nếu chưa có
-        if (docSnap.data().role !== 'SuperAdmin') {
-            firestoreDb.collection('users').doc(docSnap.id).update({ role: 'SuperAdmin' })
+        // Ensure user exists in Firebase Auth
+        try {
+            await auth.getUserByEmail(userEmail);
+            console.log(`[master-login] Auth check: User ${userEmail} already exists in Firebase Auth.`);
+        } catch (error) {
+            if (error.code === 'auth/user-not-found') {
+                console.log(`[master-login] Auth sync: User ${userEmail} not found in Firebase Auth. Creating...`);
+                await auth.createUser({
+                    uid: userId,
+                    email: userEmail,
+                    displayName: userData.name || shortName,
+                });
+                console.log(`[master-login] Auth sync: Successfully created user ${userEmail} with UID ${userId}.`);
+            } else {
+                throw error;
+            }
+        }
+        
+        const masterAdmin = { ...userData, id: userId, role: 'SuperAdmin' };
+
+        if (userData.role !== 'SuperAdmin') {
+            firestoreDb.collection('users').doc(userId).update({ role: 'SuperAdmin' })
                 .catch(e => console.error('[master-login] Failed to persist role:', e));
         }
 
-        console.log(`[master-login] SuperAdmin authenticated: ${masterAdmin.email || masterAdmin.name}`);
-        // Tạo Firebase custom token để frontend signInWithCustomToken → auth.currentUser hợp lệ
-        // Dùng UID cố định 'master-admin-uid' để tách biệt khỏi Firestore doc ID
-        const customToken = await firebaseAdmin.auth().createCustomToken('master-admin-uid', { role: 'SuperAdmin' });
+        console.log(`[master-login] SuperAdmin authenticated: ${userEmail}`);
+        
+        const customToken = await auth.createCustomToken(userId, { role: 'SuperAdmin' });
+        
         return res.json({ success: true, data: masterAdmin, token: customToken });
+
     } catch (e) {
-        console.error('[master-login] Firestore error:', e);
-        return res.status(500).json({ success: false, error: 'Auth failed' });
+        console.error('[master-login] Error:', e);
+        return res.status(500).json({ success: false, error: 'Auth failed', details: e.message });
     }
 });
 
@@ -328,6 +345,7 @@ app.post('/api/auth/user-login', async (req, res) => {
     }
     try {
         const firestoreDb = firebaseAdmin.firestore();
+        const auth = firebaseAdmin.auth();
         let foundDoc = null;
 
         // Lookup by email first, then by display name
@@ -345,17 +363,42 @@ app.post('/api/auth/user-login', async (req, res) => {
         }
 
         const userData = foundDoc.data();
+        const userEmail = userData.email;
+
         if (userData.password !== password) {
             await new Promise(r => setTimeout(r, 400));
             return res.status(401).json({ success: false, error: 'Invalid credentials' });
         }
 
+        if (!userEmail) {
+            console.error(`[user-login] Auth sync failed: User document ${foundDoc.id} is missing an email address.`);
+            return res.status(400).json({ success: false, error: 'User data is incomplete (missing email)' });
+        }
+        
+        try {
+            await auth.getUserByEmail(userEmail);
+        } catch (error) {
+            if (error.code === 'auth/user-not-found') {
+                console.log(`[user-login] Auth sync: User ${userEmail} not found in Auth. Creating...`);
+                await auth.createUser({
+                    uid: foundDoc.id,
+                    email: userEmail,
+                    displayName: userData.name,
+                });
+                console.log(`[user-login] Auth sync: Successfully created user ${userEmail} with UID ${foundDoc.id}.`);
+            } else {
+                throw error;
+            }
+        }
+
         const foundUser = { ...userData, id: foundDoc.id };
-        const customToken = await firebaseAdmin.auth().createCustomToken(foundDoc.id, { role: foundUser.role });
-        return res.json({ success: true, data: foundUser, customToken });
+        const customToken = await auth.createCustomToken(foundDoc.id, { role: foundUser.role });
+        
+        return res.json({ success: true, data: foundUser, customToken: customToken });
+
     } catch (e) {
         console.error('[user-login] Error:', e);
-        return res.status(500).json({ success: false, error: 'Login failed' });
+        return res.status(500).json({ success: false, error: 'Login failed', details: e.message });
     }
 });
 
