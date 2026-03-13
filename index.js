@@ -12,10 +12,41 @@ require('dotenv').config();
 const { migrateBatchToCDN, getCDNStats } = require('./utils/cdnSync');
 
 // ─── FIREBASE ADMIN (Token Verification) ─────────────────────────────────────
+const admin = require('firebase-admin');
 let firebaseAdmin = null;
 let firebaseAdminProjectId = null;
 const EXPECTED_FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'chonanh-a9d23';
 let authInitIssue = null;
+
+try {
+  const rawData = process.env.FIREBASE_SERVICE_ACCOUNT;
+  
+  if (!rawData) {
+    authInitIssue = "Biến môi trường FIREBASE_SERVICE_ACCOUNT đang trống!";
+    console.error("❌ [FIREBASE]: " + authInitIssue);
+  } else {
+    // 🔥 TUYỆT CHIÊU GỌT VỎ: Loại bỏ mọi dấu nháy thừa và khoảng trắng
+    const cleanData = rawData.trim().replace(/^['"]|['"]$/g, '').trim();
+    
+    const serviceAccount = JSON.parse(cleanData);
+
+    if (!admin.apps.length) {
+      firebaseAdmin = admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      firebaseAdminProjectId = serviceAccount.project_id;
+      console.log("✅ [FIREBASE]: Khởi tạo thành công Project: " + firebaseAdminProjectId);
+    } else {
+      firebaseAdmin = admin.app();
+      firebaseAdminProjectId = EXPECTED_FIREBASE_PROJECT_ID;
+    }
+  }
+} catch (e) {
+  authInitIssue = "Lỗi Parse JSON: " + e.message;
+  console.error("❌ [FIREBASE ERROR]: " + authInitIssue);
+  // Log 50 ký tự đầu để soi lỗi format
+  console.error("Nội dung nhận được (50 ký tự đầu):", process.env.FIREBASE_SERVICE_ACCOUNT?.substring(0, 50));
+}
 
 function loadServiceAccountFromEnvOrFile() {
     // Preferred: base64 payload to avoid escaping issues in dashboard env editors.
