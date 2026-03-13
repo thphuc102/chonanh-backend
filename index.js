@@ -13,16 +13,21 @@ const { migrateBatchToCDN, getCDNStats, isDriveUrl } = require('./utils/cdnSync'
 
 // ─── FIREBASE ADMIN (Token Verification) ─────────────────────────────────────
 let firebaseAdmin = null;
+let firebaseAdminProjectId = null;
+const EXPECTED_FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'chonanh-a9d23';
 try {
     const admin = require('firebase-admin');
     if (!admin.apps.length) {
         let credential;
+        let parsedServiceAccount = null;
         if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-            credential = admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
+            parsedServiceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+            credential = admin.credential.cert(parsedServiceAccount);
         } else {
             const saPath = path.join(__dirname, '../functions/service-account.json');
             if (fs.existsSync(saPath)) {
-                credential = admin.credential.cert(require(saPath));
+                parsedServiceAccount = require(saPath);
+                credential = admin.credential.cert(parsedServiceAccount);
             }
         }
         if (credential) {
@@ -31,6 +36,14 @@ try {
                 databaseURL: 'https://chonanh-a9d23-default-rtdb.asia-southeast1.firebasedatabase.app',
             });
             firebaseAdmin = admin;
+            firebaseAdminProjectId = parsedServiceAccount?.project_id || null;
+
+            if (firebaseAdminProjectId && firebaseAdminProjectId !== EXPECTED_FIREBASE_PROJECT_ID) {
+                console.error(`[Auth] Firebase project mismatch ❌ expected=${EXPECTED_FIREBASE_PROJECT_ID} actual=${firebaseAdminProjectId}`);
+                console.error('[Auth] Refusing to issue custom tokens to prevent INVALID_CUSTOM_TOKEN/CREDENTIAL_MISMATCH.');
+                firebaseAdmin = null;
+            }
+
             console.log('[Auth] Firebase Admin initialized ✅');
         } else {
             console.warn('[Auth] No Firebase service account found. Set FIREBASE_SERVICE_ACCOUNT env var.');
