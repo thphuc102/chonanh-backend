@@ -16,20 +16,45 @@ let firebaseAdmin = null;
 let firebaseAdminProjectId = null;
 const EXPECTED_FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'chonanh-a9d23';
 let authInitIssue = null;
+
+function loadServiceAccountFromEnvOrFile() {
+    // Preferred: base64 payload to avoid escaping issues in dashboard env editors.
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+        try {
+            const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
+            const parsed = JSON.parse(decoded);
+            return parsed;
+        } catch (e) {
+            authInitIssue = `Invalid FIREBASE_SERVICE_ACCOUNT_BASE64: ${e.message}`;
+            return null;
+        }
+    }
+
+    // Backward-compatible: raw JSON string
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        try {
+            return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        } catch (e) {
+            authInitIssue = `Invalid FIREBASE_SERVICE_ACCOUNT JSON: ${e.message}`;
+            return null;
+        }
+    }
+
+    const saPath = path.join(__dirname, '../functions/service-account.json');
+    if (fs.existsSync(saPath)) {
+        return require(saPath);
+    }
+
+    return null;
+}
+
 try {
     const admin = require('firebase-admin');
     if (!admin.apps.length) {
         let credential;
-        let parsedServiceAccount = null;
-        if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-            parsedServiceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        const parsedServiceAccount = loadServiceAccountFromEnvOrFile();
+        if (parsedServiceAccount) {
             credential = admin.credential.cert(parsedServiceAccount);
-        } else {
-            const saPath = path.join(__dirname, '../functions/service-account.json');
-            if (fs.existsSync(saPath)) {
-                parsedServiceAccount = require(saPath);
-                credential = admin.credential.cert(parsedServiceAccount);
-            }
         }
         if (credential) {
             admin.initializeApp({
@@ -49,7 +74,7 @@ try {
             console.log('[Auth] Firebase Admin initialized ✅');
         } else {
             console.warn('[Auth] No Firebase service account found. Set FIREBASE_SERVICE_ACCOUNT env var.');
-            authInitIssue = 'No Firebase service account found';
+            authInitIssue = authInitIssue || 'No Firebase service account found';
         }
     } else {
         firebaseAdmin = admin;
