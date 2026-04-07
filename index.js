@@ -995,6 +995,40 @@ app.get('/api/photos/:id', async (req, res) => {
     }
 });
 
+// Public bulk state endpoint for near-realtime cross-client sync (likes/comments/favorite/tags)
+app.post('/api/photos/state', async (req, res) => {
+    try {
+        const rawIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+        const ids = rawIds
+            .map((id) => String(id || '').trim())
+            .filter(Boolean)
+            .slice(0, 500);
+
+        if (!ids.length) {
+            return res.json({ success: true, data: [] });
+        }
+
+        const rows = await prisma.photo.findMany({
+            where: { id: { in: ids } },
+            select: {
+                id: true,
+                albumId: true,
+                isFavorite: true,
+                likes: true,
+                likeCount: true,
+                comments: true,
+                commentCount: true,
+                tags: true,
+            }
+        });
+
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('Error fetching photo state:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch photo state' });
+    }
+});
+
 
 
 // ─── AUDIT LOGS API [PROTECTED] ─────────────────────────────────────────────
