@@ -256,6 +256,32 @@ app.use(express.json({ limit: '50mb' }));
 
 // --- ROUTES ---
 
+const USER_COLLECTION_CANDIDATES = ['users', 'user'];
+
+async function findUserByIdentifier(firestoreDb, rawIdentifier) {
+    const identifier = String(rawIdentifier || '').trim();
+    if (!identifier) return null;
+
+    for (const collectionName of USER_COLLECTION_CANDIDATES) {
+        const emailSnap = await firestoreDb.collection(collectionName).where('email', '==', identifier).limit(1).get();
+        if (!emailSnap.empty) {
+            return { doc: emailSnap.docs[0], collectionName };
+        }
+
+        const nameSnap = await firestoreDb.collection(collectionName).where('name', '==', identifier).limit(1).get();
+        if (!nameSnap.empty) {
+            return { doc: nameSnap.docs[0], collectionName };
+        }
+
+        const usernameSnap = await firestoreDb.collection(collectionName).where('username', '==', identifier).limit(1).get();
+        if (!usernameSnap.empty) {
+            return { doc: usernameSnap.docs[0], collectionName };
+        }
+    }
+
+    return null;
+}
+
 // ─── MASTER ADMIN AUTH [SERVER-SIDE VERIFIED] ──────────────────────────────
 // Credentials được verify tại server qua env vars — password KHÔNG bao giờ có trong JS bundle.
 app.post('/api/auth/master-login', async (req, res) => {
@@ -284,14 +310,14 @@ app.post('/api/auth/master-login', async (req, res) => {
         const firestoreDb = firebaseAdmin.firestore();
         const auth = firebaseAdmin.auth();
 
-        // Find user in Firestore by email
-        const userQuery = await firestoreDb.collection('users').where('email', '==', expectedIdentifier).limit(1).get();
+        // Find user in Firestore (supports both 'users' and legacy 'user' collection)
+        const found = await findUserByIdentifier(firestoreDb, expectedIdentifier);
 
-        if (userQuery.empty) {
+        if (!found) {
             return res.status(404).json({ success: false, error: 'Master user not found in Firestore' });
         }
 
-        const userDoc = userQuery.docs[0];
+        const userDoc = found.doc;
         const userData = userDoc.data();
         const userId = userDoc.id;
         const userEmail = userData.email;
@@ -317,7 +343,7 @@ app.post('/api/auth/master-login', async (req, res) => {
         const masterAdmin = { ...userData, id: userId, role: 'SuperAdmin' };
 
         if (userData.role !== 'SuperAdmin') {
-            firestoreDb.collection('users').doc(userId).update({ role: 'SuperAdmin' })
+            firestoreDb.collection(found.collectionName).doc(userId).update({ role: 'SuperAdmin' })
                 .catch(e => console.error('[master-login] Failed to persist role:', e));
         }
 
@@ -337,7 +363,8 @@ app.post('/api/auth/master-login', async (req, res) => {
 // Moves password verification server-side so apiFetch receives a real Firebase ID token.
 app.post('/api/auth/user-login', async (req, res) => {
     const { identifier, password } = req.body || {};
-    if (!identifier || !password) {
+    const normalizedIdentifier = String(identifier || '').trim();
+    if (!normalizedIdentifier || !String(password || '').trim()) {
         return res.status(400).json({ success: false, error: 'Credentials required' });
     }
     if (!firebaseAdmin) {
@@ -346,16 +373,8 @@ app.post('/api/auth/user-login', async (req, res) => {
     try {
         const firestoreDb = firebaseAdmin.firestore();
         const auth = firebaseAdmin.auth();
-        let foundDoc = null;
-
-        // Lookup by email first, then by display name
-        const emailSnap = await firestoreDb.collection('users').where('email', '==', identifier).limit(1).get();
-        if (!emailSnap.empty) {
-            foundDoc = emailSnap.docs[0];
-        } else {
-            const nameSnap = await firestoreDb.collection('users').where('name', '==', identifier).limit(1).get();
-            if (!nameSnap.empty) foundDoc = nameSnap.docs[0];
-        }
+        const found = await findUserByIdentifier(firestoreDb, normalizedIdentifier);
+        const foundDoc = found?.doc || null;
 
         if (!foundDoc) {
             await new Promise(r => setTimeout(r, 400)); // slow brute-force
