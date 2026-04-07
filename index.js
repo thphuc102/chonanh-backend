@@ -676,6 +676,48 @@ app.get('/api/albums/:id', async (req, res) => {
     }
 });
 
+// Public guest endpoint — fetch album by ID or custom domain (for shared links)
+app.get('/api/guest/album/:identifier', async (req, res) => {
+    try {
+        const { identifier } = req.params;
+        
+        // Try to find by ID first, then by domain
+        let album = await prisma.album.findUnique({
+            where: { id: identifier }
+        });
+        
+        if (!album) {
+            album = await prisma.album.findFirst({
+                where: { domain: identifier }
+            });
+        }
+        
+        if (!album) {
+            return res.status(404).json({ success: false, error: "Album not found" });
+        }
+        
+        // Return minimal public data for guests
+        res.json({ 
+            success: true, 
+            data: {
+                id: album.id,
+                title: album.title,
+                description: album.description,
+                coverImage: album.coverImage,
+                createdAt: album.createdAt,
+                domain: album.domain,
+                finalDriveLink: album.finalDriveLink,
+                settings: album.settings,
+                status: album.status,
+                // Exclude sensitive data like passwords, analytics, etc
+            }
+        });
+    } catch (error) {
+        console.error("Error fetching guest album:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch album" });
+    }
+});
+
 // 4. Update Album [PROTECTED]
 app.put('/api/albums/:id', requireAuth, async (req, res) => {
     try {
