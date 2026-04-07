@@ -61,7 +61,7 @@ model Photo {
   comments        Json     @default("[]")
   tags            String[]
   source          String   @default("drive")
-  createdAt       String   @default("")
+  createdAt       DateTime @default(now())
   likes           String[] @default([])
   likeCount       Int      @default(0)
 
@@ -81,7 +81,7 @@ model AuditLog {
   userName  String
   action    String
   details   String
-  timestamp String
+  timestamp DateTime @default(now())
   ipAddress String?
   status    String @default("Success")
 }
@@ -94,7 +94,7 @@ model Notification {
   albumId   String?
   userId    String?
   read      Boolean @default(false)
-  createdAt String
+  createdAt DateTime @default(now())
 }
 
 model ContactRequest {
