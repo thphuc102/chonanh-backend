@@ -207,6 +207,12 @@ function extractDriveIdFromUrl(rawUrl) {
     return null;
 }
 
+function isValidEmail(value) {
+    if (!value || typeof value !== 'string') return false;
+    const email = value.trim();
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
 // Middleware
 app.use(compression()); // Gzip compress all responses
 
@@ -382,29 +388,31 @@ app.post('/api/auth/user-login', async (req, res) => {
         }
 
         const userData = foundDoc.data();
-        const userEmail = userData.email;
+        const userEmail = String(userData.email || '').trim();
 
         if (userData.password !== password) {
             await new Promise(r => setTimeout(r, 400));
             return res.status(401).json({ success: false, error: 'Invalid credentials' });
         }
 
-        if (!userEmail) {
-            console.error(`[user-login] Auth sync failed: User document ${foundDoc.id} is missing an email address.`);
-            return res.status(400).json({ success: false, error: 'User data is incomplete (missing email)' });
-        }
-        
         try {
-            await auth.getUserByEmail(userEmail);
+            await auth.getUser(foundDoc.id);
         } catch (error) {
             if (error.code === 'auth/user-not-found') {
-                console.log(`[user-login] Auth sync: User ${userEmail} not found in Auth. Creating...`);
-                await auth.createUser({
+                const payload = {
                     uid: foundDoc.id,
-                    email: userEmail,
                     displayName: userData.name,
-                });
-                console.log(`[user-login] Auth sync: Successfully created user ${userEmail} with UID ${foundDoc.id}.`);
+                };
+
+                if (isValidEmail(userEmail)) {
+                    payload.email = userEmail;
+                } else {
+                    console.warn(`[user-login] User ${foundDoc.id} has non-email identifier in email field: '${userEmail}'. Continuing with UID-based auth.`);
+                }
+
+                console.log(`[user-login] Auth sync: UID ${foundDoc.id} not found in Auth. Creating...`);
+                await auth.createUser(payload);
+                console.log(`[user-login] Auth sync: Successfully created UID ${foundDoc.id}.`);
             } else {
                 throw error;
             }
