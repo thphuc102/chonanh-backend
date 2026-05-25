@@ -18,18 +18,20 @@ const { createClient } = require('@supabase/supabase-js');
 const supabaseUrl = process.env.SUPABASE_URL || 'https://fjaamkzodjrhxsnsbzus.supabase.co';
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseServiceRoleKey) {
-    console.error("❌ [SUPABASE]: SUPABASE_SERVICE_ROLE_KEY is missing from environment variables!");
+const supabase = supabaseServiceRoleKey 
+    ? createClient(supabaseUrl, supabaseServiceRoleKey, {
+        auth: {
+            autoRefreshToken: false,
+            persistSession: false
+        }
+      })
+    : null;
+
+if (supabase) {
+    console.log("✅ [SUPABASE]: Initialized for URL: " + supabaseUrl);
+} else {
+    console.warn("⚠️ [SUPABASE]: Supabase client NOT initialized due to missing service role key!");
 }
-
-const supabase = createClient(supabaseUrl, supabaseServiceRoleKey || '', {
-    auth: {
-        autoRefreshToken: false,
-        persistSession: false
-    }
-});
-
-console.log("✅ [SUPABASE]: Initialized for URL: " + supabaseUrl);
 
 function loadServiceAccountFromEnvOrFile() {
     if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
@@ -69,6 +71,9 @@ async function requireAuth(req, res, next) {
     const token = authHeader.slice(7);
 
     try {
+        if (!supabase) {
+            return res.status(500).json({ success: false, error: 'Supabase client not initialized' });
+        }
         const { data: { user }, error } = await supabase.auth.getUser(token);
         if (error || !user) {
             return res.status(401).json({ success: false, error: 'Invalid or expired token', details: error?.message });
@@ -1095,6 +1100,24 @@ app.post('/api/albums', requireAuth, async (req, res) => {
             delete cleanData.id;
         }
 
+        if (cleanData.expiryDate) {
+            cleanData.expiryDate = new Date(cleanData.expiryDate);
+            if (isNaN(cleanData.expiryDate.getTime())) {
+                cleanData.expiryDate = null;
+            }
+        } else if (cleanData.expiryDate === '' || cleanData.expiryDate === null) {
+            cleanData.expiryDate = null;
+        }
+
+        if (cleanData.selectionLockedAt) {
+            cleanData.selectionLockedAt = new Date(cleanData.selectionLockedAt);
+            if (isNaN(cleanData.selectionLockedAt.getTime())) {
+                cleanData.selectionLockedAt = null;
+            }
+        } else if (cleanData.selectionLockedAt === '' || cleanData.selectionLockedAt === null) {
+            cleanData.selectionLockedAt = null;
+        }
+
         const newAlbum = await prisma.album.create({
             data: cleanData
         });
@@ -1187,6 +1210,24 @@ app.put('/api/albums/:id', requireAuth, async (req, res) => {
         }
 
         delete cleanUpdates.id;
+
+        if (cleanUpdates.expiryDate) {
+            cleanUpdates.expiryDate = new Date(cleanUpdates.expiryDate);
+            if (isNaN(cleanUpdates.expiryDate.getTime())) {
+                cleanUpdates.expiryDate = null;
+            }
+        } else if (cleanUpdates.expiryDate === '' || cleanUpdates.expiryDate === null) {
+            cleanUpdates.expiryDate = null;
+        }
+
+        if (cleanUpdates.selectionLockedAt) {
+            cleanUpdates.selectionLockedAt = new Date(cleanUpdates.selectionLockedAt);
+            if (isNaN(cleanUpdates.selectionLockedAt.getTime())) {
+                cleanUpdates.selectionLockedAt = null;
+            }
+        } else if (cleanUpdates.selectionLockedAt === '' || cleanUpdates.selectionLockedAt === null) {
+            cleanUpdates.selectionLockedAt = null;
+        }
 
         const updatedAlbum = await prisma.album.update({
             where: { id: req.params.id },
