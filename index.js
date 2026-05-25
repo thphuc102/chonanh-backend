@@ -186,14 +186,7 @@ const allowedOrigins = [...new Set([...staticAllowedOrigins, ...envAllowedOrigin
 
 function isAllowedOrigin(origin) {
     if (!origin) return true; // server-to-server/no-origin
-
-    if (allowedOrigins.includes(origin)) return true;
-
-    // Firebase Hosting default domains
-    if (/^https:\/\/[a-z0-9-]+\.web\.app$/i.test(origin)) return true;
-    if (/^https:\/\/[a-z0-9-]+\.firebaseapp\.com$/i.test(origin)) return true;
-
-    return false;
+    return allowedOrigins.includes(origin);
 }
 
 app.use(cors({
@@ -1954,20 +1947,7 @@ if (require.main === module) {
         console.log(`✅ Server đang chạy tại cổng ${PORT}`);
         console.log(`🌐 Truy cập: http://localhost:${PORT}`);
 
-        const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `https://chonanh-backend.onrender.com`;
-        const PING_INTERVAL = 12 * 60 * 1000;
-
-        setInterval(async () => {
-            try {
-                const res = await fetch(`${RENDER_URL}/`);
-                const data = await res.json();
-                console.log(`🏓 Keep-alive ping: ${data.message} | ${new Date().toISOString()}`);
-            } catch (err) {
-                console.error(`❌ Keep-alive ping failed:`, err.message);
-            }
-        }, PING_INTERVAL);
-
-        console.log(`🏓 Keep-alive ping enabled: every 12 minutes`);
+        // Keep-alive pinger removed as Render is deprecated.
     });
 }
 
