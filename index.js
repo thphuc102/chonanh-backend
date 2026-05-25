@@ -186,7 +186,9 @@ const allowedOrigins = [...new Set([...staticAllowedOrigins, ...envAllowedOrigin
 
 function isAllowedOrigin(origin) {
     if (!origin) return true; // server-to-server/no-origin
-    return allowedOrigins.includes(origin);
+    if (allowedOrigins.includes(origin)) return true;
+    if (origin.endsWith('.vercel.app')) return true;
+    return false;
 }
 
 app.use(cors({
@@ -236,12 +238,14 @@ app.post('/api/auth/master-login', async (req, res) => {
     }
 
     try {
-        let user = await prisma.user.findUnique({ where: { email: expectedIdentifier } });
+        const supabaseEmail = expectedIdentifier.includes('@') ? expectedIdentifier : `${expectedIdentifier}@chonanh.com`;
+
+        let user = await prisma.user.findUnique({ where: { email: supabaseEmail } });
         if (!user) {
             let uid;
             try {
                 const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
-                    email: expectedIdentifier,
+                    email: supabaseEmail,
                     password: expectedPassword,
                     email_confirm: true,
                     user_metadata: { name: 'SuperAdmin' }
@@ -250,7 +254,7 @@ app.post('/api/auth/master-login', async (req, res) => {
                 if (authError) {
                     if (authError.status === 422 || authError.message.includes('already exists')) {
                         const { data: { users } } = await supabase.auth.admin.listUsers();
-                        const foundUser = users?.find(u => u.email === expectedIdentifier);
+                        const foundUser = users?.find(u => u.email === supabaseEmail);
                         uid = foundUser?.id;
                     } else {
                         throw authError;
@@ -261,7 +265,7 @@ app.post('/api/auth/master-login', async (req, res) => {
             } catch (e) {
                 console.warn('[master-login] Supabase Auth creation failed, attempting lookup:', e.message);
                 const { data: { users } } = await supabase.auth.admin.listUsers();
-                const foundUser = users?.find(u => u.email === expectedIdentifier);
+                const foundUser = users?.find(u => u.email === supabaseEmail);
                 uid = foundUser?.id;
             }
 
@@ -273,7 +277,7 @@ app.post('/api/auth/master-login', async (req, res) => {
                 data: {
                     id: uid,
                     name: 'SuperAdmin',
-                    email: expectedIdentifier,
+                    email: supabaseEmail,
                     role: 'SuperAdmin',
                     status: 'Active',
                     plan: 'enterprise',
@@ -285,7 +289,7 @@ app.post('/api/auth/master-login', async (req, res) => {
         }
 
         const { data, error } = await supabase.auth.signInWithPassword({
-            email: expectedIdentifier,
+            email: supabaseEmail,
             password: expectedPassword
         });
 

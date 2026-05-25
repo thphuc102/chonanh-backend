@@ -46,6 +46,7 @@ model Album {
 
   photos            Photo[]
   guestbookEntries  GuestbookEntry[]
+  rsvps             RSVP[]
 }
 
 model Photo {
@@ -142,4 +143,41 @@ model GuestbookEntry {
   album      Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
 
   @@index([albumId, createdAt(sort: Desc)])
+}
+
+model User {
+  id                 String    @id
+  name               String
+  email              String    @unique
+  role               String    @default("User")
+  status             String    @default("Active")
+  avatar             String    @default("")
+  lastActive         String?
+  phone              String?
+  plan               String    @default("free")
+  subscriptionStatus String    @default("active")
+  subscriptionStart  String?
+  subscriptionEnd    String?
+  subscriptionNotes  String?
+  albumsUsed         Int       @default(0)
+  albumsLimit        Int       @default(2)
+  storageUsedMB      Int       @default(0)
+  storageLimitMB     Int       @default(500)
+  weddingAddOns      String[]  @default([])
+  createdAt          String?
+}
+
+model RSVP {
+  id          String   @id @default(uuid())
+  albumId     String
+  name        String
+  phone       String
+  attending   Boolean
+  guestsCount Int      @default(0)
+  note        String?
+  createdAt   DateTime @default(now())
+
+  album       Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+
+  @@index([albumId])
 }
