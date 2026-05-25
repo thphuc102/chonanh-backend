@@ -30,12 +30,12 @@ model Album {
   shootDate         String?
   shootLocation     String?
   password          String?
-  expiryDate        String?
+  expiryDate        DateTime? @db.Date
   landingCover      String?
   landingAvatar     String?
   landingFooter     String?
   selectionStatus   String?  @default("selecting")
-  selectionLockedAt String?
+  selectionLockedAt DateTime?
   priceLink         String?
   zaloLink          String?
   totalViews        Int      @default(0)
@@ -45,6 +45,7 @@ model Album {
   settings          Json?
 
   photos            Photo[]
+  guestbookEntries  GuestbookEntry[]
 }
 
 model Photo {
@@ -111,10 +112,10 @@ model ContactRequest {
   albumId       String?
   albumName     String?
   status        String  @default("pending")
-  createdAt     String?
-  contactedAt   String?
-  completedAt   String?
-  respondedAt   String?
+  createdAt     DateTime?
+  contactedAt   DateTime?
+  completedAt   DateTime?
+  respondedAt   DateTime?
   respondedBy   String?
   adminNotes    String?
 }
@@ -127,4 +128,18 @@ model Workspace {
   createdAt String
 
   @@index([userId])
+}
+
+model GuestbookEntry {
+  id         String   @id
+  albumId    String
+  senderName String
+  message    String
+  stickerUrl String?
+  createdAt  DateTime @default(now())
+  isPrivate  Boolean  @default(false)
+
+  album      Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+
+  @@index([albumId, createdAt(sort: Desc)])
 }

@@ -16,8 +16,9 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "firebase-admin": "^13.7.0",
-    "lru-cache": "^11.2.6"
+    "googleapis": "^172.0.0",
+    "lru-cache": "^11.2.6",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "prisma": "^6.9.0"

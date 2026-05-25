@@ -6,113 +6,57 @@ const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
 const { LRUCache } = require('lru-cache');
+const { google } = require('googleapis');
+const sharp = require('sharp');
 require('dotenv').config();
 
 // CDN Sync utilities (Cloudflare R2 + Supabase Storage)
 const { migrateBatchToCDN, getCDNStats } = require('./utils/cdnSync');
 
-// ─── FIREBASE ADMIN (Token Verification) ─────────────────────────────────────
-const admin = require('firebase-admin');
-let firebaseAdmin = null;
-let firebaseAdminProjectId = null;
-const EXPECTED_FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'chonanh-a9d23';
-let authInitIssue = null;
+// ─── SUPABASE CLIENT (Token Verification & Admin Operations) ───────────────────
+const { createClient } = require('@supabase/supabase-js');
+const supabaseUrl = process.env.SUPABASE_URL || 'https://fjaamkzodjrhxsnsbzus.supabase.co';
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-try {
-  const rawData = process.env.FIREBASE_SERVICE_ACCOUNT;
-  
-  if (!rawData) {
-    authInitIssue = "Biến môi trường FIREBASE_SERVICE_ACCOUNT đang trống!";
-    console.error("❌ [FIREBASE]: " + authInitIssue);
-  } else {
-    // 🔥 TUYỆT CHIÊU GỌT VỎ: Loại bỏ mọi dấu nháy thừa và khoảng trắng
-    const cleanData = rawData.trim().replace(/^['"]|['"]$/g, '').trim();
-    
-    const serviceAccount = JSON.parse(cleanData);
-
-    if (!admin.apps.length) {
-      firebaseAdmin = admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-      });
-      firebaseAdminProjectId = serviceAccount.project_id;
-      console.log("✅ [FIREBASE]: Khởi tạo thành công Project: " + firebaseAdminProjectId);
-    } else {
-      firebaseAdmin = admin.app();
-      firebaseAdminProjectId = EXPECTED_FIREBASE_PROJECT_ID;
-    }
-  }
-} catch (e) {
-  authInitIssue = "Lỗi Parse JSON: " + e.message;
-  console.error("❌ [FIREBASE ERROR]: " + authInitIssue);
-  // Log 50 ký tự đầu để soi lỗi format
-  console.error("Nội dung nhận được (50 ký tự đầu):", process.env.FIREBASE_SERVICE_ACCOUNT?.substring(0, 50));
+if (!supabaseServiceRoleKey) {
+    console.error("❌ [SUPABASE]: SUPABASE_SERVICE_ROLE_KEY is missing from environment variables!");
 }
 
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey || '', {
+    auth: {
+        autoRefreshToken: false,
+        persistSession: false
+    }
+});
+
+console.log("✅ [SUPABASE]: Initialized for URL: " + supabaseUrl);
+
 function loadServiceAccountFromEnvOrFile() {
-    // Preferred: base64 payload to avoid escaping issues in dashboard env editors.
     if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
         try {
             const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
-            const parsed = JSON.parse(decoded);
-            return parsed;
+            return JSON.parse(decoded);
         } catch (e) {
-            authInitIssue = `Invalid FIREBASE_SERVICE_ACCOUNT_BASE64: ${e.message}`;
+            console.error(`Invalid FIREBASE_SERVICE_ACCOUNT_BASE64: ${e.message}`);
             return null;
         }
     }
 
-    // Backward-compatible: raw JSON string
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         try {
             return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
         } catch (e) {
-            authInitIssue = `Invalid FIREBASE_SERVICE_ACCOUNT JSON: ${e.message}`;
+            console.error(`Invalid FIREBASE_SERVICE_ACCOUNT JSON: ${e.message}`);
             return null;
         }
     }
 
-    const saPath = path.join(__dirname, '../functions/service-account.json');
+    const saPath = path.join(__dirname, './service-account.json');
     if (fs.existsSync(saPath)) {
         return require(saPath);
     }
 
     return null;
-}
-
-try {
-    const admin = require('firebase-admin');
-    if (!admin.apps.length) {
-        let credential;
-        const parsedServiceAccount = loadServiceAccountFromEnvOrFile();
-        if (parsedServiceAccount) {
-            credential = admin.credential.cert(parsedServiceAccount);
-        }
-        if (credential) {
-            admin.initializeApp({
-                credential,
-                databaseURL: 'https://chonanh-a9d23-default-rtdb.asia-southeast1.firebasedatabase.app',
-            });
-            firebaseAdmin = admin;
-            firebaseAdminProjectId = parsedServiceAccount?.project_id || null;
-
-            if (firebaseAdminProjectId && firebaseAdminProjectId !== EXPECTED_FIREBASE_PROJECT_ID) {
-                console.error(`[Auth] Firebase project mismatch ❌ expected=${EXPECTED_FIREBASE_PROJECT_ID} actual=${firebaseAdminProjectId}`);
-                console.error('[Auth] Refusing to issue custom tokens to prevent INVALID_CUSTOM_TOKEN/CREDENTIAL_MISMATCH.');
-                authInitIssue = `Firebase project mismatch: expected=${EXPECTED_FIREBASE_PROJECT_ID}, actual=${firebaseAdminProjectId}`;
-                firebaseAdmin = null;
-            }
-
-            console.log('[Auth] Firebase Admin initialized ✅');
-        } else {
-            console.warn('[Auth] No Firebase service account found. Set FIREBASE_SERVICE_ACCOUNT env var.');
-            authInitIssue = authInitIssue || 'No Firebase service account found';
-        }
-    } else {
-        firebaseAdmin = admin;
-    }
-} catch (e) {
-    console.warn('[Auth] firebase-admin not available:', e.message);
-    authInitIssue = `firebase-admin init error: ${e.message}`;
 }
 
 // ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
@@ -121,15 +65,15 @@ async function requireAuth(req, res, next) {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ success: false, error: 'Authentication required' });
     }
-    if (!firebaseAdmin) {
-        console.error('[Auth] Firebase Admin not initialized — rejecting request');
-        return res.status(503).json({ success: false, error: 'Auth service unavailable', details: authInitIssue || null });
-    }
 
     const token = authHeader.slice(7);
 
     try {
-        req.user = await firebaseAdmin.auth().verifyIdToken(token);
+        const { data: { user }, error } = await supabase.auth.getUser(token);
+        if (error || !user) {
+            return res.status(401).json({ success: false, error: 'Invalid or expired token', details: error?.message });
+        }
+        req.user = user;
         next();
     } catch (err) {
         return res.status(401).json({ success: false, error: 'Invalid or expired token' });
@@ -166,6 +110,9 @@ const PORT = process.env.PORT || 5000;
 
 const PHOTO_PAGE_DEFAULT_LIMIT = 50;
 const PHOTO_PAGE_MAX_LIMIT = 100;
+
+const DUAL_WRITE_FIRESTORE = false;
+const DATA_READ_MODE = 'postgres_only';
 
 function encodePhotoCursor(cursor) {
     return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
@@ -255,109 +202,100 @@ app.use(cors({
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],
 }));
 
 app.use(express.json({ limit: '50mb' }));
 
-// --- ROUTES ---
+app.use((req, res, next) => {
+    const requestId = String(req.headers['x-request-id'] || '').trim() || randomUUID();
+    req.requestId = requestId;
+    res.set('x-request-id', requestId);
+    res.set('x-data-read-mode', DATA_READ_MODE);
+    next();
+});
 
-const USER_COLLECTION_CANDIDATES = ['users', 'user'];
+// Firestore helper functions removed because Firebase is deprecated.
 
-async function findUserByIdentifier(firestoreDb, rawIdentifier) {
-    const identifier = String(rawIdentifier || '').trim();
-    if (!identifier) return null;
-
-    for (const collectionName of USER_COLLECTION_CANDIDATES) {
-        const emailSnap = await firestoreDb.collection(collectionName).where('email', '==', identifier).limit(1).get();
-        if (!emailSnap.empty) {
-            return { doc: emailSnap.docs[0], collectionName };
-        }
-
-        const nameSnap = await firestoreDb.collection(collectionName).where('name', '==', identifier).limit(1).get();
-        if (!nameSnap.empty) {
-            return { doc: nameSnap.docs[0], collectionName };
-        }
-
-        const usernameSnap = await firestoreDb.collection(collectionName).where('username', '==', identifier).limit(1).get();
-        if (!usernameSnap.empty) {
-            return { doc: usernameSnap.docs[0], collectionName };
-        }
-    }
-
-    return null;
-}
+// Route handlers follow below
 
 // ─── MASTER ADMIN AUTH [SERVER-SIDE VERIFIED] ──────────────────────────────
-// Credentials được verify tại server qua env vars — password KHÔNG bao giờ có trong JS bundle.
 app.post('/api/auth/master-login', async (req, res) => {
     const { identifier, password } = req.body || {};
-    const expectedIdentifier = process.env.MASTER_ADMIN_IDENTIFIER; // This should be an email
+    const expectedIdentifier = process.env.MASTER_ADMIN_IDENTIFIER || 'thphuc@chonanh.com';
     const expectedPassword   = process.env.MASTER_ADMIN_PASSWORD;
 
     if (!expectedIdentifier || !expectedPassword) {
         return res.status(503).json({ success: false, error: 'Master auth not configured on server' });
     }
 
-    // So sánh email lẫn username (phần trước @)
     const shortName = expectedIdentifier.includes('@') ? expectedIdentifier.split('@')[0] : expectedIdentifier;
     const identifierOk = identifier === expectedIdentifier || identifier === shortName;
 
     if (!identifierOk || password !== expectedPassword) {
-        await new Promise(r => setTimeout(r, 500)); // làm chậm brute-force
+        await new Promise(r => setTimeout(r, 500));
         return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
 
-    if (!firebaseAdmin) {
-        return res.status(503).json({ success: false, error: 'Auth service unavailable', details: authInitIssue || null });
-    }
-
     try {
-        const firestoreDb = firebaseAdmin.firestore();
-        const auth = firebaseAdmin.auth();
-
-        // Find user in Firestore (supports both 'users' and legacy 'user' collection)
-        const found = await findUserByIdentifier(firestoreDb, expectedIdentifier);
-
-        if (!found) {
-            return res.status(404).json({ success: false, error: 'Master user not found in Firestore' });
-        }
-
-        const userDoc = found.doc;
-        const userData = userDoc.data();
-        const userId = userDoc.id;
-        const userEmail = userData.email;
-
-        // Ensure user exists in Firebase Auth
-        try {
-            await auth.getUserByEmail(userEmail);
-            console.log(`[master-login] Auth check: User ${userEmail} already exists in Firebase Auth.`);
-        } catch (error) {
-            if (error.code === 'auth/user-not-found') {
-                console.log(`[master-login] Auth sync: User ${userEmail} not found in Firebase Auth. Creating...`);
-                await auth.createUser({
-                    uid: userId,
-                    email: userEmail,
-                    displayName: userData.name || shortName,
+        let user = await prisma.user.findUnique({ where: { email: expectedIdentifier } });
+        if (!user) {
+            let uid;
+            try {
+                const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
+                    email: expectedIdentifier,
+                    password: expectedPassword,
+                    email_confirm: true,
+                    user_metadata: { name: 'SuperAdmin' }
                 });
-                console.log(`[master-login] Auth sync: Successfully created user ${userEmail} with UID ${userId}.`);
-            } else {
-                throw error;
+
+                if (authError) {
+                    if (authError.status === 422 || authError.message.includes('already exists')) {
+                        const { data: { users } } = await supabase.auth.admin.listUsers();
+                        const foundUser = users?.find(u => u.email === expectedIdentifier);
+                        uid = foundUser?.id;
+                    } else {
+                        throw authError;
+                    }
+                } else if (authUser?.user) {
+                    uid = authUser.user.id;
+                }
+            } catch (e) {
+                console.warn('[master-login] Supabase Auth creation failed, attempting lookup:', e.message);
+                const { data: { users } } = await supabase.auth.admin.listUsers();
+                const foundUser = users?.find(u => u.email === expectedIdentifier);
+                uid = foundUser?.id;
             }
-        }
-        
-        const masterAdmin = { ...userData, id: userId, role: 'SuperAdmin' };
 
-        if (userData.role !== 'SuperAdmin') {
-            firestoreDb.collection(found.collectionName).doc(userId).update({ role: 'SuperAdmin' })
-                .catch(e => console.error('[master-login] Failed to persist role:', e));
+            if (!uid) {
+                uid = randomUUID();
+            }
+
+            user = await prisma.user.create({
+                data: {
+                    id: uid,
+                    name: 'SuperAdmin',
+                    email: expectedIdentifier,
+                    role: 'SuperAdmin',
+                    status: 'Active',
+                    plan: 'enterprise',
+                    albumsLimit: 9999,
+                    storageLimitMB: 102400,
+                    createdAt: new Date().toISOString()
+                }
+            });
         }
 
-        console.log(`[master-login] SuperAdmin authenticated: ${userEmail}`);
-        
-        const customToken = await auth.createCustomToken(userId, { role: 'SuperAdmin' });
-        
-        return res.json({ success: true, data: masterAdmin, token: customToken });
+        const { data, error } = await supabase.auth.signInWithPassword({
+            email: expectedIdentifier,
+            password: expectedPassword
+        });
+
+        if (error) {
+            return res.status(401).json({ success: false, error: 'Auth failed', details: error.message });
+        }
+
+        return res.json({ success: true, data: user, session: data.session });
 
     } catch (e) {
         console.error('[master-login] Error:', e);
@@ -365,67 +303,275 @@ app.post('/api/auth/master-login', async (req, res) => {
     }
 });
 
-// POST /api/auth/user-login — Server-side Firestore credential check + Firebase custom token
-// Moves password verification server-side so apiFetch receives a real Firebase ID token.
+// POST /api/auth/user-login
 app.post('/api/auth/user-login', async (req, res) => {
     const { identifier, password } = req.body || {};
     const normalizedIdentifier = String(identifier || '').trim();
     if (!normalizedIdentifier || !String(password || '').trim()) {
         return res.status(400).json({ success: false, error: 'Credentials required' });
     }
-    if (!firebaseAdmin) {
-        return res.status(503).json({ success: false, error: 'Auth service unavailable', details: authInitIssue || null });
-    }
+
     try {
-        const firestoreDb = firebaseAdmin.firestore();
-        const auth = firebaseAdmin.auth();
-        const found = await findUserByIdentifier(firestoreDb, normalizedIdentifier);
-        const foundDoc = found?.doc || null;
+        const dbUser = await prisma.user.findFirst({
+            where: {
+                OR: [
+                    { email: normalizedIdentifier },
+                    { name: normalizedIdentifier },
+                    { phone: normalizedIdentifier }
+                ]
+            }
+        });
 
-        if (!foundDoc) {
-            await new Promise(r => setTimeout(r, 400)); // slow brute-force
-            return res.status(401).json({ success: false, error: 'Invalid credentials' });
-        }
-
-        const userData = foundDoc.data();
-        const userEmail = String(userData.email || '').trim();
-
-        if (userData.password !== password) {
+        if (!dbUser) {
             await new Promise(r => setTimeout(r, 400));
             return res.status(401).json({ success: false, error: 'Invalid credentials' });
         }
 
-        try {
-            await auth.getUser(foundDoc.id);
-        } catch (error) {
-            if (error.code === 'auth/user-not-found') {
-                const payload = {
-                    uid: foundDoc.id,
-                    displayName: userData.name,
-                };
+        const { data, error } = await supabase.auth.signInWithPassword({
+            email: dbUser.email,
+            password: password
+        });
 
-                if (isValidEmail(userEmail)) {
-                    payload.email = userEmail;
-                } else {
-                    console.warn(`[user-login] User ${foundDoc.id} has non-email identifier in email field: '${userEmail}'. Continuing with UID-based auth.`);
-                }
-
-                console.log(`[user-login] Auth sync: UID ${foundDoc.id} not found in Auth. Creating...`);
-                await auth.createUser(payload);
-                console.log(`[user-login] Auth sync: Successfully created UID ${foundDoc.id}.`);
-            } else {
-                throw error;
-            }
+        if (error) {
+            await new Promise(r => setTimeout(r, 400));
+            return res.status(401).json({ success: false, error: 'Invalid credentials', details: error.message });
         }
 
-        const foundUser = { ...userData, id: foundDoc.id };
-        const customToken = await auth.createCustomToken(foundDoc.id, { role: foundUser.role });
-        
-        return res.json({ success: true, data: foundUser, customToken: customToken });
+        return res.json({ success: true, data: dbUser, session: data.session });
 
     } catch (e) {
         console.error('[user-login] Error:', e);
         return res.status(500).json({ success: false, error: 'Login failed', details: e.message });
+    }
+});
+
+// ─── USER MANAGEMENT API ─────────────────────────────────────────────────────
+
+app.get('/api/users', requireAuth, async (req, res) => {
+    try {
+        const requester = await prisma.user.findUnique({ where: { id: req.user.id } });
+        if (!requester || (requester.role !== 'Admin' && requester.role !== 'SuperAdmin')) {
+            return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
+
+        const users = await prisma.user.findMany({
+            orderBy: { createdAt: 'desc' }
+        });
+        return res.json({ success: true, data: users });
+    } catch (error) {
+        console.error("Error fetching users:", error);
+        return res.status(500).json({ success: false, error: "Failed to fetch users" });
+    }
+});
+
+app.post('/api/users', requireAuth, async (req, res) => {
+    try {
+        const requester = await prisma.user.findUnique({ where: { id: req.user.id } });
+        if (!requester || (requester.role !== 'Admin' && requester.role !== 'SuperAdmin')) {
+            return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
+
+        const { email, password, name, role, plan, albumsLimit, storageLimitMB, phone } = req.body;
+        if (!email || !password || !name) {
+            return res.status(400).json({ success: false, error: 'email, password and name are required' });
+        }
+
+        const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
+            email,
+            password,
+            email_confirm: true,
+            user_metadata: { name }
+        });
+
+        if (authError) {
+            return res.status(400).json({ success: false, error: 'Failed to create auth user', details: authError.message });
+        }
+
+        const uid = authUser.user.id;
+
+        const newUser = await prisma.user.create({
+            data: {
+                id: uid,
+                email,
+                name,
+                role: role || 'User',
+                phone: phone || '',
+                plan: plan || 'free',
+                albumsLimit: albumsLimit !== undefined ? Number(albumsLimit) : 2,
+                storageLimitMB: storageLimitMB !== undefined ? Number(storageLimitMB) : 500,
+                status: 'Active',
+                createdAt: new Date().toISOString()
+            }
+        });
+
+        return res.status(201).json({ success: true, data: newUser });
+    } catch (error) {
+        console.error("Error creating user:", error);
+        return res.status(500).json({ success: false, error: "Failed to create user", details: error.message });
+    }
+});
+
+app.put('/api/users/:id', requireAuth, async (req, res) => {
+    try {
+        const requester = await prisma.user.findUnique({ where: { id: req.user.id } });
+        if (!requester || (requester.role !== 'Admin' && requester.role !== 'SuperAdmin')) {
+            return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
+
+        const userId = req.params.id;
+        const updates = req.body;
+
+        const allowedKeys = [
+            'name', 'role', 'status', 'avatar', 'phone', 'plan', 
+            'subscriptionStatus', 'subscriptionStart', 'subscriptionEnd', 'subscriptionNotes',
+            'albumsLimit', 'storageLimitMB', 'weddingAddOns'
+        ];
+
+        const cleanUpdates = {};
+        for (const key of allowedKeys) {
+            if (updates[key] !== undefined) {
+                cleanUpdates[key] = updates[key];
+            }
+        }
+
+        const authUpdates = {};
+        if (updates.email) authUpdates.email = updates.email;
+        if (updates.password) authUpdates.password = updates.password;
+
+        if (Object.keys(authUpdates).length > 0) {
+            const { error: authError } = await supabase.auth.admin.updateUserById(userId, authUpdates);
+            if (authError) {
+                return res.status(400).json({ success: false, error: 'Failed to update auth user', details: authError.message });
+            }
+            if (updates.email) {
+                cleanUpdates.email = updates.email;
+            }
+        }
+
+        const updatedUser = await prisma.user.update({
+            where: { id: userId },
+            data: cleanUpdates
+        });
+
+        return res.json({ success: true, data: updatedUser });
+    } catch (error) {
+        console.error("Error updating user:", error);
+        return res.status(500).json({ success: false, error: "Failed to update user", details: error.message });
+    }
+});
+
+app.delete('/api/users/:id', requireAuth, async (req, res) => {
+    try {
+        const requester = await prisma.user.findUnique({ where: { id: req.user.id } });
+        if (!requester || (requester.role !== 'Admin' && requester.role !== 'SuperAdmin')) {
+            return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
+
+        const userId = req.params.id;
+
+        const { error: authError } = await supabase.auth.admin.deleteUser(userId);
+        if (authError) {
+            console.warn('[user-delete] Supabase Auth deletion warning:', authError.message);
+        }
+
+        await prisma.user.delete({
+            where: { id: userId }
+        });
+
+        return res.json({ success: true, message: 'User deleted successfully' });
+    } catch (error) {
+        console.error("Error deleting user:", error);
+        return res.status(500).json({ success: false, error: "Failed to delete user", details: error.message });
+    }
+});
+
+// ─── RSVP API ────────────────────────────────────────────────────────────────
+
+app.post('/api/albums/:albumId/rsvp', guestRateLimiter, async (req, res) => {
+    try {
+        const { name, phone, attending, guestsCount, note } = req.body;
+        const albumId = req.params.albumId;
+
+        if (!name || !phone || attending === undefined) {
+            return res.status(400).json({ success: false, error: 'name, phone and attending status are required' });
+        }
+
+        const rsvp = await prisma.rSVP.create({
+            data: {
+                albumId,
+                name,
+                phone,
+                attending: Boolean(attending),
+                guestsCount: guestsCount !== undefined ? Number(guestsCount) : 0,
+                note: note || ''
+            }
+        });
+
+        return res.status(201).json({ success: true, data: rsvp });
+    } catch (error) {
+        console.error("Error creating RSVP:", error);
+        return res.status(500).json({ success: false, error: "Failed to submit RSVP", details: error.message });
+    }
+});
+
+app.get('/api/albums/:albumId/rsvp', requireAuth, async (req, res) => {
+    try {
+        const albumId = req.params.albumId;
+
+        const album = await prisma.album.findUnique({
+            where: { id: albumId }
+        });
+        if (!album) {
+            return res.status(404).json({ success: false, error: 'Album not found' });
+        }
+
+        const requester = await prisma.user.findUnique({ where: { id: req.user.id } });
+        const isOwner = album.creatorId === req.user.id;
+        const isAdmin = requester && (requester.role === 'Admin' || requester.role === 'SuperAdmin');
+
+        if (!isOwner && !isAdmin) {
+            return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
+
+        const rsvps = await prisma.rSVP.findMany({
+            where: { albumId },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        return res.json({ success: true, data: rsvps });
+    } catch (error) {
+        console.error("Error fetching RSVPs:", error);
+        return res.status(500).json({ success: false, error: "Failed to fetch RSVPs" });
+    }
+});
+
+app.delete('/api/albums/:albumId/rsvp/:id', requireAuth, async (req, res) => {
+    try {
+        const { albumId, id } = req.params;
+
+        const album = await prisma.album.findUnique({
+            where: { id: albumId }
+        });
+        if (!album) {
+            return res.status(404).json({ success: false, error: 'Album not found' });
+        }
+
+        const requester = await prisma.user.findUnique({ where: { id: req.user.id } });
+        const isOwner = album.creatorId === req.user.id;
+        const isAdmin = requester && (requester.role === 'Admin' || requester.role === 'SuperAdmin');
+
+        if (!isOwner && !isAdmin) {
+            return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
+
+        await prisma.rSVP.delete({
+            where: { id }
+        });
+
+        return res.json({ success: true, message: 'RSVP deleted successfully' });
+    } catch (error) {
+        console.error("Error deleting RSVP:", error);
+        return res.status(500).json({ success: false, error: "Failed to delete RSVP" });
     }
 });
 
@@ -460,6 +606,7 @@ app.post('/api/photos/:id/like', guestRateLimiter, async (req, res) => {
             where: { id: req.params.id },
             data: { likeCount: { increment: 1 } },
         });
+
         res.json({ success: true, likeCount: updated.likeCount });
     } catch (error) {
         if (error.code === 'P2025') {
@@ -523,6 +670,7 @@ async function handleAddComment(req, res) {
         if (!rows || rows.length === 0) {
             return res.status(404).json({ success: false, error: 'Photo not found' });
         }
+
         res.status(201).json({ success: true, comment: built.comment, commentCount: Number(rows[0].commentCount) });
     } catch (error) {
         console.error('Error adding comment:', error);
@@ -597,8 +745,310 @@ app.post('/api/photos/:id/comments', guestRateLimiter, handleAddComment);
 // DELETE — atomic delete comment endpoint (Sprint 1)
 app.delete('/api/photos/:id/comments/:commentId', guestRateLimiter, handleDeleteComment);
 
+// GET /api/albums/:albumId/guestbook — Public guestbook feed
+app.get('/api/albums/:albumId/guestbook', async (req, res) => {
+    try {
+        const rows = await prisma.guestbookEntry.findMany({
+            where: { albumId: req.params.albumId },
+            orderBy: { createdAt: 'desc' },
+            take: 50,
+        });
+
+        const data = rows.map((row) => ({
+            ...row,
+            createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt,
+        }));
+
+        return res.json({ success: true, data });
+    } catch (error) {
+        console.error('Error fetching guestbook entries:', error);
+        return res.status(500).json({ success: false, error: 'Failed to fetch guestbook entries' });
+    }
+});
+
+// POST /api/albums/:albumId/guestbook — Public submit guestbook entry
+app.post('/api/albums/:albumId/guestbook', guestRateLimiter, async (req, res) => {
+    try {
+        const senderName = String(req.body?.senderName || '').trim().slice(0, 120);
+        const message = String(req.body?.message || '').trim().slice(0, 1000);
+        const stickerUrl = req.body?.stickerUrl ? String(req.body.stickerUrl).slice(0, 50) : null;
+        const isPrivate = Boolean(req.body?.isPrivate);
+
+        if (!senderName || !message) {
+            return res.status(400).json({ success: false, error: 'senderName and message are required' });
+        }
+
+        const id = randomUUID();
+
+        const createdRow = await prisma.guestbookEntry.create({
+            data: {
+                id,
+                albumId: req.params.albumId,
+                senderName,
+                message,
+                stickerUrl,
+                isPrivate,
+            },
+        });
+
+        const created = {
+            ...createdRow,
+            createdAt: createdRow.createdAt instanceof Date ? createdRow.createdAt.toISOString() : createdRow.createdAt,
+        };
+
+        return res.status(201).json({ success: true, data: created });
+    } catch (error) {
+        console.error('Error creating guestbook entry:', error);
+        return res.status(500).json({ success: false, error: 'Failed to create guestbook entry' });
+    }
+});
+
 // POST /api/contact-requests — Ai cũng có thể gửi liên hệ (Guest, rate-limited)
 // NOTE: Route này được giữ public nhưng di chuyển lên đây để rõ ràng hơn.
+
+// ─── GOOGLE DRIVE SYNC & PROXY ENDPOINTS ───────────────────────────────────────
+
+/** Fetch ALL image files in a Google Drive folder, handling pagination automatically */
+async function listFilesInFolder(driveClient, folderId) {
+    let allFiles = [];
+    let pageToken = null;
+    let pageCount = 0;
+    do {
+        pageCount++;
+        const res = await driveClient.files.list({
+            q: `'${folderId}' in parents and mimeType contains 'image/' and trashed = false`,
+            fields: "nextPageToken, files(id, name, thumbnailLink, createdTime, webContentLink)",
+            pageSize: 1000,
+            pageToken: pageToken || undefined,
+        });
+        if (res.data.files) {
+            allFiles = allFiles.concat(res.data.files);
+        }
+        pageToken = res.data.nextPageToken;
+    } while (pageToken);
+    return allFiles;
+}
+
+/** Helper to generate Google Drive image URL */
+const getImageUrl = (file) => {
+    if (file.thumbnailLink) {
+        return file.thumbnailLink.replace("=s220", "=s2000");
+    }
+    if (file.webContentLink) {
+        return file.webContentLink;
+    }
+    if (file.id) {
+        return `https://drive.google.com/thumbnail?id=${file.id}&sz=w2000`;
+    }
+    return null;
+};
+
+/** Authenticated Google Drive sync endpoint */
+app.post('/api/albums/sync-drive', requireAuth, async (req, res) => {
+    const { driveLink, downloadDriveLink, finalDriveLink } = req.body;
+
+    if (!driveLink) {
+        return res.status(400).json({ success: false, error: 'driveLink is required' });
+    }
+
+    try {
+        const parsedServiceAccount = loadServiceAccountFromEnvOrFile();
+        if (!parsedServiceAccount) {
+            console.error('[sync-drive] No service account credentials found.');
+            return res.status(500).json({ success: false, error: 'Google Drive authentication not configured' });
+        }
+
+        const driveAuth = new google.auth.GoogleAuth({
+            credentials: {
+                client_email: parsedServiceAccount.client_email,
+                private_key: parsedServiceAccount.private_key,
+            },
+            scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+        });
+        const driveClient = google.drive({ version: 'v3', auth: driveAuth });
+
+        const folderId = extractDriveIdFromUrl(driveLink);
+        const downloadFolderId = downloadDriveLink ? extractDriveIdFromUrl(downloadDriveLink) : null;
+        const finalFolderId = finalDriveLink ? extractDriveIdFromUrl(finalDriveLink) : null;
+
+        if (!folderId) {
+            return res.status(400).json({ success: false, error: 'Invalid Google Drive Link' });
+        }
+
+        const originalFiles = await listFilesInFolder(driveClient, folderId);
+        let downloadFiles = [];
+        let finalFiles = [];
+
+        if (downloadFolderId) {
+            try {
+                downloadFiles = await listFilesInFolder(driveClient, downloadFolderId);
+            } catch (e) {
+                console.error('[sync-drive] Error listing download folder:', e.message);
+            }
+        }
+
+        if (finalFolderId) {
+            try {
+                finalFiles = await listFilesInFolder(driveClient, finalFolderId);
+            } catch (e) {
+                console.error('[sync-drive] Error listing final folder:', e.message);
+            }
+        }
+
+        const downloadMap = new Map();
+        downloadFiles.forEach((f) => {
+            downloadMap.set(f.name, f.webContentLink);
+        });
+
+        const processedPhotos = originalFiles.map((file) => {
+            const imageUrl = getImageUrl(file);
+            return {
+                id: file.id,
+                name: file.name,
+                url: imageUrl,
+                thumbnailLink: file.thumbnailLink,
+                isFavorite: false,
+                commentCount: 0,
+                source: "drive",
+                createdAt: file.createdTime,
+                downloadUrl: downloadMap.get(file.name) || null,
+            };
+        });
+
+        const processedFinalPhotos = finalFiles.map((file) => {
+            const imageUrl = getImageUrl(file);
+            return {
+                id: file.id,
+                name: file.name,
+                url: imageUrl,
+                thumbnailLink: file.thumbnailLink,
+                isFavorite: false,
+                commentCount: 0,
+                source: "final",
+                isInWeddingView: true,
+                createdAt: file.createdTime,
+                downloadUrl: file.webContentLink || null,
+            };
+        });
+
+        const allPhotos = [...processedPhotos, ...processedFinalPhotos];
+
+        return res.json({
+            success: true,
+            photos: allPhotos,
+            count: allPhotos.length
+        });
+
+    } catch (error) {
+        console.error('[sync-drive] Sync failed:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message || 'Không thể truy cập thư mục Google Drive. Vui lòng kiểm tra lại quyền chia sẻ.'
+        });
+    }
+});
+
+/** Helper to proxy Google Drive image stream, resize using Sharp and return WebP */
+async function handleImageProxy(fileId, width, quality, res) {
+    try {
+        const parsedServiceAccount = loadServiceAccountFromEnvOrFile();
+        if (!parsedServiceAccount) {
+            console.error('[proxy-img] No credentials found.');
+            return res.status(500).send('Google Drive proxy authentication not configured');
+        }
+
+        const driveAuth = new google.auth.GoogleAuth({
+            credentials: {
+                client_email: parsedServiceAccount.client_email,
+                private_key: parsedServiceAccount.private_key,
+            },
+            scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+        });
+        const driveClient = google.drive({ version: 'v3', auth: driveAuth });
+
+        const response = await driveClient.files.get(
+            { fileId, alt: 'media' },
+            { responseType: 'stream' }
+        );
+
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+
+        const shouldOptimize = width && width > 0;
+
+        if (shouldOptimize) {
+            res.setHeader('Content-Type', 'image/webp');
+            
+            const transformer = sharp().resize({
+                width,
+                withoutEnlargement: true,
+                fit: 'inside'
+            }).webp({ quality: quality || 80 });
+
+            response.data.on('error', (err) => {
+                console.error('[proxy-img] Stream read error:', err.message);
+                if (!res.headersSent) res.status(500).send('Stream error');
+            });
+
+            transformer.on('error', (err) => {
+                console.error('[proxy-img] Sharp error:', err.message);
+                if (!res.headersSent) {
+                    res.setHeader('Content-Type', 'image/jpeg');
+                    response.data.pipe(res);
+                }
+            });
+
+            response.data.pipe(transformer).pipe(res);
+        } else {
+            res.setHeader('Content-Type', 'image/jpeg');
+            response.data.pipe(res);
+        }
+    } catch (error) {
+        console.error(`[proxy-img] Error proxying file ${fileId}:`, error.message);
+        if (!res.headersSent) {
+            res.status(500).send('Internal Server Error or File Not Found');
+        }
+    }
+}
+
+/** GET /api/img/:id — Proxy image from Google Drive file ID */
+app.get('/api/img/:id', async (req, res) => {
+    const fileId = req.params.id;
+    const wStr = req.query.w || req.query.width;
+    const qStr = req.query.q || req.query.quality;
+
+    const width = wStr ? parseInt(wStr, 10) : null;
+    const quality = qStr ? parseInt(qStr, 10) : 80;
+
+    await handleImageProxy(fileId, width, quality, res);
+});
+
+/** GET /api/proxy-url — Proxy image from direct Google Drive URL */
+app.get('/api/proxy-url', async (req, res) => {
+    const rawParam = req.query.url;
+    if (!rawParam) {
+        return res.status(400).send('Missing url param');
+    }
+
+    let targetUrl = rawParam;
+    try {
+        if (targetUrl.startsWith('http%')) targetUrl = decodeURIComponent(targetUrl);
+    } catch (e) { /* ignore */ }
+
+    const driveId = extractDriveIdFromUrl(targetUrl);
+    if (!driveId) {
+        return res.status(400).send('Invalid or non-Drive URL');
+    }
+
+    const wStr = req.query.w || req.query.width;
+    const qStr = req.query.q || req.query.quality;
+
+    const width = wStr ? parseInt(wStr, 10) : null;
+    const quality = qStr ? parseInt(qStr, 10) : 80;
+
+    await handleImageProxy(driveId, width, quality, res);
+});
+
 
 // ─── ALBUMS API ───────────────────────────────────────────────────────────────
 
@@ -641,7 +1091,6 @@ app.post('/api/albums', requireAuth, async (req, res) => {
             cleanData.createdAt = new Date().toISOString();
         }
 
-        // Ensure ID is completely omitted if not provided so Prisma generates a UUID
         if (!cleanData.id) {
             delete cleanData.id;
         }
@@ -666,6 +1115,7 @@ app.get('/api/albums/:id', async (req, res) => {
         const album = await prisma.album.findUnique({
             where: { id: req.params.id }
         });
+
         if (!album) {
             return res.status(404).json({ success: false, error: "Album not found" });
         }
@@ -681,7 +1131,6 @@ app.get('/api/guest/album/:identifier', async (req, res) => {
     try {
         const { identifier } = req.params;
         
-        // Try to find by ID first, then by domain
         let album = await prisma.album.findUnique({
             where: { id: identifier }
         });
@@ -696,7 +1145,6 @@ app.get('/api/guest/album/:identifier', async (req, res) => {
             return res.status(404).json({ success: false, error: "Album not found" });
         }
         
-        // Return minimal public data for guests
         res.json({ 
             success: true, 
             data: {
@@ -709,7 +1157,6 @@ app.get('/api/guest/album/:identifier', async (req, res) => {
                 finalDriveLink: album.finalDriveLink,
                 settings: album.settings,
                 status: album.status,
-                // Exclude sensitive data like passwords, analytics, etc
             }
         });
     } catch (error) {
@@ -732,7 +1179,6 @@ app.put('/api/albums/:id', requireAuth, async (req, res) => {
             'totalViews', 'maxSelections', 'createdAt', 'settings'
         ];
 
-        // Clean up undefined/null values and unknown fields
         const cleanUpdates = {};
         for (const key of allowedAlbumKeys) {
             if (updates[key] !== undefined) {
@@ -740,7 +1186,6 @@ app.put('/api/albums/:id', requireAuth, async (req, res) => {
             }
         }
 
-        // Don't allow changing the ID
         delete cleanUpdates.id;
 
         const updatedAlbum = await prisma.album.update({
@@ -761,9 +1206,11 @@ app.put('/api/albums/:id', requireAuth, async (req, res) => {
 // 5. Delete Album [PROTECTED]
 app.delete('/api/albums/:id', requireAuth, async (req, res) => {
     try {
+        const albumId = req.params.id;
         await prisma.album.delete({
-            where: { id: req.params.id }
+            where: { id: albumId }
         });
+
         res.json({ success: true, message: "Album deleted successfully" });
     } catch (error) {
         console.error("Error deleting album:", error);
@@ -827,7 +1274,6 @@ app.get('/api/albums/:albumId/photos', async (req, res) => {
             ? encodePhotoCursor({ createdAt: last.createdAt || '', id: last.id })
             : null;
 
-        // Cache for 30 seconds on client to reduce repeated fetches
         res.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
         res.json({
             success: true,
@@ -849,7 +1295,7 @@ app.get('/api/albums/:albumId/photos', async (req, res) => {
 // Batch add photos [PROTECTED]
 app.post('/api/albums/:albumId/photos', requireAuth, async (req, res) => {
     try {
-        const { photos } = req.body; // Array of photo objects
+        const { photos } = req.body;
         if (!photos || !Array.isArray(photos) || photos.length === 0) {
             return res.status(400).json({ success: false, error: "No photos provided" });
         }
@@ -873,7 +1319,6 @@ app.post('/api/albums/:albumId/photos', requireAuth, async (req, res) => {
             return clean;
         });
 
-        // Use createMany for efficiency, skipDuplicates to avoid errors on re-sync
         const result = await prisma.photo.createMany({
             data: cleanPhotos,
             skipDuplicates: true
@@ -903,12 +1348,13 @@ app.put('/api/photos/:id', requireAuth, async (req, res) => {
             }
         }
         delete cleanUpdates.id;
-        delete cleanUpdates.albumId; // Don't allow changing album
+        delete cleanUpdates.albumId;
 
         const photo = await prisma.photo.update({
             where: { id: req.params.id },
             data: cleanUpdates
         });
+
         res.json({ success: true, data: photo });
     } catch (error) {
         console.error("Error updating photo:", error);
@@ -1462,26 +1908,26 @@ app.post('/api/admin/migrate-cdn', requireAuth, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Start Server
-app.listen(PORT, () => {
-    console.log(`✅ Server đang chạy tại cổng ${PORT}`);
-    console.log(`🌐 Truy cập: http://localhost:${PORT}`);
+if (require.main === module) {
+    app.listen(PORT, () => {
+        console.log(`✅ Server đang chạy tại cổng ${PORT}`);
+        console.log(`🌐 Truy cập: http://localhost:${PORT}`);
 
-    // --- KEEP-ALIVE SELF-PING ---
-    // Render free tier sleeps after 15 min inactivity.
-    // Self-ping every 12 minutes to stay awake (buffer before 15 min timeout).
-    const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `https://chonanh-backend.onrender.com`;
-    const PING_INTERVAL = 12 * 60 * 1000; // 12 minutes (reduced from 14)
+        const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `https://chonanh-backend.onrender.com`;
+        const PING_INTERVAL = 12 * 60 * 1000;
 
-    setInterval(async () => {
-        try {
-            const res = await fetch(`${RENDER_URL}/`);
-            const data = await res.json();
-            console.log(`🏓 Keep-alive ping: ${data.message} | ${new Date().toISOString()}`);
-        } catch (err) {
-            console.error(`❌ Keep-alive ping failed:`, err.message);
-        }
-    }, PING_INTERVAL);
+        setInterval(async () => {
+            try {
+                const res = await fetch(`${RENDER_URL}/`);
+                const data = await res.json();
+                console.log(`🏓 Keep-alive ping: ${data.message} | ${new Date().toISOString()}`);
+            } catch (err) {
+                console.error(`❌ Keep-alive ping failed:`, err.message);
+            }
+        }, PING_INTERVAL);
 
-    console.log(`🏓 Keep-alive ping enabled: every 12 minutes`);
-});
+        console.log(`🏓 Keep-alive ping enabled: every 12 minutes`);
+    });
+}
+
+module.exports = app;
